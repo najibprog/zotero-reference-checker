@@ -28,6 +28,7 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+        # If the release was already created (e.g. by hand on GitHub), just attach/replace the .xpi
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" zotero-reference-checker.xpi --clobber
