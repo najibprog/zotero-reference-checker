@@ -1,0 +1,44 @@
+name: Release
+
+# Push a tag like v1.3.0 to publish a release:
+#   git tag v1.3.0 && git push origin v1.3.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Unit tests
+        run: npm test
+      - name: Set version from tag
+        run: node scripts/set-version.mjs "$GITHUB_REF_NAME"
+      - name: Build
+        run: sh build.sh
+      - name: Generate updates.json
+        run: node scripts/make-updates-json.mjs zotero-reference-checker.xpi
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" zotero-reference-checker.xpi \
+            --title "$GITHUB_REF_NAME" --generate-notes
+      # Zotero reads update_url = .../releases/download/release/updates.json,
+      # so updates.json always lives in the fixed "release" release
+      - name: Update the auto-update manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view release >/dev/null 2>&1; then
+            gh release create release --title "Auto-update manifest" \
+              --notes "Used by Zotero to check for new versions. Do not delete." --latest=false
+          fi
+          gh release upload release updates.json --clobber

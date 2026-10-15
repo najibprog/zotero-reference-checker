@@ -1,0 +1,11 @@
+{
+  "name": "zotero-reference-checker",
+  "private": true,
+  "description": "Zotero plugin: see which references of an article are in your library and open their PDF",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "build": "sh build.sh"
+  }
+}

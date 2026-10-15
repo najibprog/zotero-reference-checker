@@ -1,0 +1,48 @@
+<vbox id="refcheck-prefpane">
+	<groupbox>
+		<label><html:h2>Elsevier / ScienceDirect PDFs</html:h2></label>
+		<html:p style="margin: 0 0 8px; max-width: 560px">
+			With a personal Elsevier API key, “Add” and “Find PDF” can download ScienceDirect PDFs
+			through Elsevier's official API — for articles your institution gives you access to
+			(on campus or VPN). Your key stays in your Zotero preferences and is only sent to api.elsevier.com.
+		</html:p>
+		<html:p style="margin: 0 0 8px">
+			Get a free key at
+			<html:a href="https://dev.elsevier.com/apikey/manage"
+				onclick="Zotero.launchURL(this.href); return false;">https://dev.elsevier.com/apikey/manage</html:a>
+		</html:p>
+
+		<hbox align="center">
+			<label value="API key:" control="refcheck-els-key" style="min-width: 150px"/>
+			<html:input id="refcheck-els-key" type="password" size="40"
+				preference="extensions.refcheck.elsevierApiKey"/>
+		</hbox>
+		<hbox align="center">
+			<label value="Institutional token (optional):" control="refcheck-els-token" style="min-width: 150px"/>
+			<html:input id="refcheck-els-token" type="password" size="40"
+				preference="extensions.refcheck.elsevierInstToken"/>
+		</hbox>
+		<html:p style="margin: 4px 0 8px; color: GrayText; max-width: 560px">
+			The institutional token is only needed to download off campus; ask your library or Elsevier support for it.
+		</html:p>
+
+		<hbox align="center">
+			<button label="Test key"
+				oncommand="let r = document.getElementById('refcheck-els-result'); r.textContent = 'Testing…'; Zotero.RefCheck.testElsevierKey().then((m) => { r.textContent = m; });"/>
+			<html:span id="refcheck-els-result"/>
+		</hbox>
+	</groupbox>
+
+	<groupbox>
+		<label><html:h2>Crossref</html:h2></label>
+		<html:p style="margin: 0 0 8px; max-width: 560px">
+			Optional. Crossref asks tools to include a contact email; requests that do are served
+			faster. The email is only sent to api.crossref.org.
+		</html:p>
+		<hbox align="center">
+			<label value="Contact email:" control="refcheck-crossref-email" style="min-width: 150px"/>
+			<html:input id="refcheck-crossref-email" type="email" size="40"
+				preference="extensions.refcheck.crossrefEmail"/>
+		</hbox>
+	</groupbox>
+</vbox>
