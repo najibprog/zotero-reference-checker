@@ -125,8 +125,8 @@ If something goes wrong at startup, the plugin writes `reference-checker-startup
 1. Run through the manual checklist below.
 2. Tag and push. The version comes from the tag:
    ```bash
-   git tag v1.3.0
-   git push origin v1.3.0
+   git tag v1.3.1
+   git push origin v1.3.1
    ```
 3. The **Release** workflow runs the tests, sets the version in `manifest.json`, builds `zotero-reference-checker.xpi`, publishes the GitHub release, and updates `updates.json` in the fixed `release` release. That's the file Zotero checks for updates, so don't delete that release.
 

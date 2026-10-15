@@ -1,7 +1,7 @@
 name: Release
 
-# Push a tag like v1.3.0 to publish a release:
-#   git tag v1.3.0 && git push origin v1.3.0
+# Push a tag like v1.3.1 to publish a release:
+#   git tag v1.3.1 && git push origin v1.3.1
 on:
   push:
     tags: ["v*"]
