@@ -4,3 +4,7 @@ refcheck-section-sidenav =
     .tooltiptext = References in Library
 refcheck-rescan =
     .tooltiptext = Rescan references
+refcheck-back-header =
+    .label = Back to article
+refcheck-back-sidenav =
+    .tooltiptext = Back to the article you came from

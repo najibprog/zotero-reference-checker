@@ -20,6 +20,8 @@ export function loadRefCheck(libraryItems = []) {
   vm.createContext(context);
   const source = readFileSync(new URL("../content/refcheck.js", import.meta.url), "utf8");
   vm.runInContext(source + "\nthis.RefCheck = RefCheck;", context);
+  // Lets a test add to the Zotero stub
+  context.RefCheck.__zotero = context.Zotero;
   return context.RefCheck;
 }
 

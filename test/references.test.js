@@ -67,3 +67,62 @@ test("articleURL uses the DOI, or a Google Scholar search", () => {
   assert.equal(R.articleURL({ text: "… https://doi.org/10.1287/trsc.2016.0732" }), "https://doi.org/10.1287/trsc.2016.0732");
   assert.match(R.articleURL({ text: "Smith (2019) A title" }), /^https:\/\/scholar\.google\.com\/scholar\?q=/);
 });
+
+// Styles where each entry ends with its year (SIAM, ACM, some IEEE / LNCS variants)
+const yearLast = [
+  "J.-F. Cordeau and G. Laporte. A tabu search heuristic for periodic and multi-depot routing. Networks, 30(2):105–119, 1997.",
+  "M. Gendreau, A. Hertz, and G. Laporte. A tabu search heuristic for the vehicle routing problem. Management Science, 40(10):1276–1290, 1994.",
+  "P. Toth and D. Vigo. The Vehicle Routing Problem. SIAM, Philadelphia, 2002.",
+  "D. Pisinger. A general heuristic for vehicle routing problems. Computers & Operations Research, 34(8):2403–2435, 2007.",
+];
+
+test("splits year-ending entries, one per line, with 'and' and hyphenated initials", () => {
+  const refs = R.splitReferences(yearLast.join("\n"));
+  assert.equal(refs.length, 4);
+  assert.match(refs[2], /^P\. Toth and D\. Vigo/);
+  assert.match(refs[3], /^D\. Pisinger\./);
+});
+
+test("splits year-ending entries wrapped over several lines", () => {
+  const section = [
+    "J.-F. Cordeau and G. Laporte. A tabu search heuristic for periodic and",
+    "multi-depot routing. Networks, 30(2):105–119, 1997.",
+    "M. Gendreau, A. Hertz, and G. Laporte. A tabu search heuristic for the vehicle",
+    "routing problem. Management Science, 40(10):1276–1290,",
+    "1994.",
+    "P. Toth and D. Vigo. The Vehicle Routing Problem. SIAM, Philadelphia, 2002.",
+  ].join("\n");
+  const refs = R.splitReferences(section);
+  assert.equal(refs.length, 3);
+  assert.match(refs[1], /1276–1290, 1994\.$/);
+});
+
+test("splits year-ending entries run together on one line", () => {
+  const refs = R.splitReferences(yearLast.join(" "));
+  assert.equal(refs.length, 4);
+  assert.match(refs[0], /, 1997\.$/);
+  assert.match(refs[1], /^M\. Gendreau, A\. Hertz/);
+});
+
+test("doesn't split APA entries after the year in parentheses", () => {
+  const section = "Smith, J. (2019). A. B. testing of routing methods. J. Res., 1, 1–2.\nJones, B. (2018). An early study. J. Res., 2, 3–4.";
+  const refs = R.splitReferences(section);
+  assert.equal(refs.length, 2);
+  assert.match(refs[0], /^Smith, J\. \(2019\)\. A\. B\. testing/);
+});
+
+test("splits year-ending entries whose first author has a multi-word surname", () => {
+  const first = "T. Bektaş, T. G. Crainic, and T. Van Woensel. From Managing Urban Freight to Smart City Logistics Networks, volume 8 of Series on Computers and Operations Research, chapter 7, pages 143–188. World Scientific, 2017.";
+  const second = "I. Ben Mohamed, W. Klibi, O. Labarthe, J.-C. Deschamps, and M. Z. Babai. Modelling and solution approaches for the interconnected city logistics. Int. J. Prod. Res., 55(9):2664–2684, 2017.";
+  const third = "T. Van Woensel and J. Da Silva. A third paper on routing. Transp. Sci., 50(1):1–10, 2016.";
+  for (const sep of [" ", "  ", "\n"]) {
+    const refs = R.splitReferences([first, second, third].join(sep));
+    assert.equal(refs.length, 3, JSON.stringify(sep));
+    assert.match(refs[0], /World Scientific, 2017\.$/);
+    assert.match(refs[1], /^I\. Ben Mohamed, W\. Klibi/);
+    assert.match(refs[2], /^T\. Van Woensel and J\. Da Silva/);
+  }
+  // As copied from the PDF: lines wrapped in the middle of entries
+  const wrapped = "T. Bektaş, T. G. Crainic, and T. Van Woensel. From Managing Urban Freight to Smart City\nLogistics Networks, volume 8 of Series on Computers and Operations Research, chapter 7, pages 143–188. World Scientific, 2017.\nI. Ben Mohamed, W. Klibi, O. Labarthe, J.-C. Deschamps, and M. Z. Babai. Modelling and\nsolution approaches for the interconnected city logistics. Int. J. Prod. Res., 55(9):2664–2684, 2017.";
+  assert.equal(R.splitReferences(wrapped).length, 2);
+});

@@ -45,4 +45,23 @@
 				preference="extensions.refcheck.crossrefEmail"/>
 		</hbox>
 	</groupbox>
+
+	<groupbox>
+		<label><html:h2>OpenAlex (Cited by)</html:h2></label>
+		<html:p style="margin: 0 0 8px; max-width: 560px">
+			Optional. The “Cited by” section lists citing articles from OpenAlex. Without a key,
+			everyone on your network shares one small free daily allowance; a free personal key
+			gives you your own. The key is only sent to api.openalex.org.
+		</html:p>
+		<html:p style="margin: 0 0 8px">
+			Get a free key at
+			<html:a href="https://openalex.org/settings/api"
+				onclick="Zotero.launchURL(this.href); return false;">https://openalex.org/settings/api</html:a>
+		</html:p>
+		<hbox align="center">
+			<label value="API key:" control="refcheck-openalex-key" style="min-width: 150px"/>
+			<html:input id="refcheck-openalex-key" type="password" size="40"
+				preference="extensions.refcheck.openalexApiKey"/>
+		</hbox>
+	</groupbox>
 </vbox>

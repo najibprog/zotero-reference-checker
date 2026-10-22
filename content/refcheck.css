@@ -149,3 +149,43 @@
   color: #fff;
   border-color: transparent;
 }
+
+.refcheck-view {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.refcheck-facets {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.refcheck-more {
+  font-style: italic;
+}
+
+.refcheck-num {
+  font-variant-numeric: tabular-nums;
+  color: var(--fill-secondary, #777);
+  font-weight: 600;
+}
+
+.refcheck-related {
+  color: var(--accent-blue, #4072e5);
+}
+
+.refcheck-flash {
+  background: var(--accent-yellow, rgba(255, 210, 0, 0.35));
+  transition: background 0.6s;
+}
+
+.refcheck-back {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}

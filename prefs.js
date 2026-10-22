@@ -4,3 +4,6 @@ pref("extensions.refcheck.onlyInLibrary", false);
 pref("extensions.refcheck.elsevierApiKey", "");
 pref("extensions.refcheck.elsevierInstToken", "");
 pref("extensions.refcheck.crossrefEmail", "");
+pref("extensions.refcheck.openalexApiKey", "");
+// "cited", "newest" or "oldest"
+pref("extensions.refcheck.citedBySort", "cited");

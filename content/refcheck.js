@@ -27,6 +27,18 @@ var SECTION_NAMES = new Set([
 var PREF_ELS_KEY = "extensions.refcheck.elsevierApiKey";
 var PREF_ELS_TOKEN = "extensions.refcheck.elsevierInstToken";
 var PREF_CROSSREF_EMAIL = "extensions.refcheck.crossrefEmail";
+var PREF_OPENALEX_KEY = "extensions.refcheck.openalexApiKey";
+var PREF_CITEDBY_SORT = "extensions.refcheck.citedBySort";
+var CITEDBY_PAGE_SIZE = 100;
+// Publication types offered by the Type filter, in display order
+var PUB_TYPES = ["Journal article", "Conference paper", "Book / chapter", "Thesis", "Report", "Preprint", "Other"];
+var ITEM_TYPE_TO_PUB = {
+  journalArticle: "Journal article", conferencePaper: "Conference paper", book: "Book / chapter",
+  bookSection: "Book / chapter", thesis: "Thesis", report: "Report", preprint: "Preprint",
+};
+var CONFERENCE_RE = /\b(?:proceedings|proc\.|conference|symposium|workshop|congress|colloquium)\b/i;
+// Journals shown before "More"
+var TOP_JOURNALS = 8;
 var HOMEPAGE = "https://github.com/najibprog/zotero-reference-checker";
 // DOI prefixes used by Elsevier journals (ScienceDirect)
 var ELSEVIER_PREFIXES = ["10.1016/", "10.1006/", "10.1053/", "10.1054/", "10.1067/", "10.1078/", "10.1383/", "10.1157/"];
@@ -44,6 +56,11 @@ var HEADINGS = [
   "Riferimenti bibliografici", "RIFERIMENTI BIBLIOGRAFICI",
 ];
 
+// First author written initials first: "J. Smith,", "J.-F. Cordeau and", "M. A. de Souza &", "D. Pisinger.",
+// including surnames of several capitalised words: "I. Ben Mohamed,", "T. Van Woensel and"
+var INITIALS_FIRST = "\\p{Lu}\\.(?:\\s?-?\\p{Lu}\\.)*\\s?(?:(?:van|von|de|der|den|da|di|du|le|la|dos|del)\\s)*"
+  + "\\p{Lu}[\\p{L}'’\\-]+(?:\\s\\p{Lu}[\\p{L}'’\\-]+){0,2}(?:,|\\.|\\s+(?:and|&)\\s)";
+
 // A line that looks like the start of a new reference entry
 var REF_START_RE = new RegExp(
   "^(?:[•▪◦·\\-–]\\s*)?(?:"
@@ -51,17 +68,20 @@ var REF_START_RE = new RegExp(
     + "|\\d{1,3}[.)]\\s+\\S"                                       // 12. / 12)
     + "|\\p{Lu}[\\p{L}'’\\-]+(?:\\s(?:van|von|de|der|den|da|di|du|le|la|dos|del)(?=\\s))*"
     + "(?:\\s\\p{Lu}[\\p{L}'’\\-]+)?,\\s*(?:\\p{Lu}\\.|\\p{Lu}\\p{Ll}+)" // Smith, J. / Smith, John
-    + "|\\p{Lu}\\.\\s?(?:\\p{Lu}\\.\\s?)*\\p{Lu}[\\p{L}'’\\-]+,"   // J. Smith,
+    + "|" + INITIALS_FIRST                                         // J. Smith, / J.-F. Cordeau and
     + "|\\p{Lu}[\\p{L}'’\\-]+\\s(?:\\p{Lu}\\.\\s?)+[,(]"                // Smith J., / Smith J. A. (
   + ")",
   "u"
 );
 
-// Inline split points when several entries run together on one line:
+// Inline split points when several entries run together on one line: year-ending styles,
 // APA/Harvard "…, 1–10. Smith, J." and Springer/Vancouver "…, 52:4351–4363 Smith AB, Jones C"
 var INLINE_SPLIT_RES = [
+  // Entries that end with their year: "…, 40(10):1276–1290, 1994. P. Toth and D. Vigo. …"
+  new RegExp("(?<=[\\s,;:](?:1[89]|20)\\d{2}[a-z]?\\.)\\s+(?=" + INITIALS_FIRST + ")", "u"),
   new RegExp(
-    "(?<=[.)\\]])\\s+(?=(?:\\d{1,3}\\.\\s+)?\\p{Lu}[\\p{L}'’\\-]+(?:\\s\\p{Lu}[\\p{L}'’\\-]+)?,\\s(?:\\p{Lu}\\.|\\p{Lu}\\p{Ll}+,))",
+    // (not right after an initial: "M. Gendreau, A. Hertz" is one author list)
+    "(?<=[.)\\]])(?<!(?:^|[\\s.\\-])\\p{Lu}\\.)\\s+(?=(?:\\d{1,3}\\.\\s+)?\\p{Lu}[\\p{L}'’\\-]+(?:\\s\\p{Lu}[\\p{L}'’\\-]+)?,\\s(?:\\p{Lu}\\.|\\p{Lu}\\p{Ll}+,))",
     "u"
   ),
   new RegExp(
@@ -82,6 +102,8 @@ var RefCheck = {
   _indexPromise: null,
   _textCache: new Map(),
   _crossrefCache: new Map(),
+  _citedByCache: new Map(),
+  _openAlexIDs: new Map(),
   _lastProps: null,
   _waitingForConnector: false,
   _refreshTimer: null,
@@ -112,6 +134,12 @@ var RefCheck = {
       link.href = this.rootURI + "content/refcheck.css";
       doc.documentElement.appendChild(link);
     }
+    // A click on the "Back" side-bar icon returns to the article (Zotero would only scroll to the section)
+    win.refcheckBackClick = (event) => {
+      let hit = event.composedPath().some((n) => n.getAttribute?.("data-pane") === this.backPaneID && n.closest?.("item-pane-sidenav"));
+      if (hit) this.goBack(win);
+    };
+    doc.addEventListener("click", win.refcheckBackClick, true);
     this.windows.add(win);
   },
 
@@ -124,6 +152,7 @@ var RefCheck = {
   removeFromWindow(win) {
     let doc = win.document;
     doc.getElementById("refcheck-stylesheet")?.remove();
+    if (win.refcheckBackClick) doc.removeEventListener("click", win.refcheckBackClick, true);
     doc.querySelector('[href="refcheck.ftl"]')?.remove();
     this.windows.delete(win);
   },
@@ -212,6 +241,21 @@ var RefCheck = {
       if (!this.paneID) throw new Error("registerSection returned false (invalid options)");
     });
 
+    await this.step("back section", () => {
+      // Temporary side-bar icon below ours, shown after "Show" / "Open PDF" to return to the article
+      this.backPaneID = Zotero.ItemPaneManager.registerSection({
+        paneID: "refcheck-back",
+        pluginID: this.id,
+        header: { l10nID: "refcheck-back-header", icon: this.rootURI + "content/icons/back.svg" },
+        sidenav: { l10nID: "refcheck-back-sidenav", icon: this.rootURI + "content/icons/back.svg" },
+        onItemChange: ({ item, setEnabled }) => {
+          setEnabled(!!(this._focus?.away && item && item.id !== this._focus.itemID));
+          return true;
+        },
+        onRender: ({ body }) => this.renderBackSection(body),
+      });
+    });
+
     await this.step("notifier", () => {
       this.notifierID = Zotero.Notifier.registerObserver(
         {
@@ -229,6 +273,32 @@ var RefCheck = {
       );
     });
 
+    await this.step("tab notifier", () => {
+      // Back in the reader after "Show" or "Open PDF": scroll the panel to the row used
+      this.tabNotifierID = Zotero.Notifier.registerObserver(
+        {
+          notify: (event, type, ids) => {
+            let f = this._focus;
+            if (!f || !f.body.isConnected) return;
+            let win = f.body.ownerDocument.defaultView;
+            if (event === "select" && (ids?.[0] ?? win.Zotero_Tabs?.selectedID) === f.tabID) {
+              // Back on the article: no more "Back to" buttons, scroll to the row used
+              f.away = false;
+              win.setTimeout(() => {
+                let list = f.body.querySelector(".refcheck-view .refcheck-list");
+                if (list && f.body.refcheckSection?.value !== "citedby") this.restoreRow(f.body, f.itemID, list);
+              }, 400);
+            }
+            // The other tab's panel may not re-render (item already shown), so add the button now and once it has
+            this.updateBackButtons(win.document);
+            win.setTimeout(() => this.updateBackButtons(win.document), 400);
+          },
+        },
+        ["tab"],
+        "refcheck-tabs"
+      );
+    });
+
     await this.step("reader popup", () => {
       Zotero.Reader.registerEventListener(
         "renderTextSelectionPopup",
@@ -243,9 +313,17 @@ var RefCheck = {
       Zotero.ItemPaneManager.unregisterSection(this.paneID);
       this.paneID = null;
     }
+    if (this.backPaneID) {
+      Zotero.ItemPaneManager.unregisterSection(this.backPaneID);
+      this.backPaneID = null;
+    }
     if (this.notifierID) {
       Zotero.Notifier.unregisterObserver(this.notifierID);
       this.notifierID = null;
+    }
+    if (this.tabNotifierID) {
+      Zotero.Notifier.unregisterObserver(this.tabNotifierID);
+      this.tabNotifierID = null;
     }
     // Reader listeners are removed automatically by plugin ID on shutdown,
     // but do it explicitly in case of a reload without restart
@@ -547,6 +625,11 @@ var RefCheck = {
 
     let source = ref.author || text.replace(/^(?:\[\d{1,3}\]|\d{1,3}[.)])\s*/, "").replace(/^[•▪◦·\-–]\s*/, "");
     let words = source.match(/[\p{L}'’\-]+/gu) || [];
+    // Author fields from Crossref may put the initials first: "ZC Yin", "J. Smith", "J.-F. Cordeau"
+    if (ref.author) {
+      let names = words.filter((w) => !/^-?(?:\p{Lu}-?){1,3}$/u.test(w));
+      if (names.length) words = names;
+    }
     let particles = ["van", "von", "de", "der", "den", "da", "di", "du", "le", "la", "dos", "del", "ten", "ter"];
     let surname = words[0] || "";
     if (particles.includes(surname.toLowerCase()) && words[1]) {
@@ -556,21 +639,50 @@ var RefCheck = {
     return { num: num || index + 1, surname: surname.length >= 2 ? surname : "", year };
   },
 
-  /** Citation key of every row, and whether the article uses numeric citations ([3], [2–5]) */
+  /**
+   * Citation key of every row, and the article's citation style: author–year, or numeric
+   * with numbers in brackets [3], in parentheses (3) or as superscripts (routing3,4).
+   * @returns {{ useNumeric: boolean, numStyle: "bracket"|"paren"|"super", byNum: Map }}
+   */
   citationInfo(rows, body) {
     rows.forEach((row, i) => { row.key = this.citationKey(row.ref, i); });
-    // Decide the citation style by which one actually locates more references:
+    // Decide the style by which one actually locates more references:
     // brackets like [0, 1] in formulas must not make an author–year paper look numeric
-    let cited = new Set();
-    for (let m of body.matchAll(/\[(\d{1,3}(?:\s*[–\-,;]\s*\d{1,3})*)\]/g)) {
-      for (let n of this.bracketNumbers(m[1])) if (n <= rows.length) cited.add(n);
-    }
     let flat = this.searchable(body.replace(/\s+/g, " ")).s;
     let byAuthorYear = rows.filter((row) => this.authorYearRegex(row.key)?.test(flat)).length;
+    let best = { style: "bracket", count: 0 };
+    for (let style of ["bracket", "paren", "super"]) {
+      let cited = new Set();
+      for (let c of this.numericCitations(flat, style)) {
+        for (let n of c.nums) if (n <= rows.length) cited.add(n);
+      }
+      // Parentheses and superscripts are also used for equations and formulas: ask for more evidence
+      let needed = style === "bracket" ? 0 : Math.max(3, rows.length * 0.3);
+      if (cited.size > best.count && cited.size >= needed) best = { style, count: cited.size };
+    }
     return {
-      useNumeric: cited.size > byAuthorYear,
+      useNumeric: best.count > byAuthorYear,
+      numStyle: best.style,
       byNum: new Map(rows.map((row, i) => [row.key.num, i])),
     };
+  },
+
+  /**
+   * Numeric citations in a text, in one style.
+   * @param {"bracket"|"paren"|"super"} style - "[3, 5–7]", "(3, 5–7)", or superscripts read as
+   *   digits right after a word or punctuation: "routing3,5–7 and", "studied.12"
+   * @returns {{ index, end, nums: number[] }[]}
+   */
+  numericCitations(text, style = "bracket") {
+    let list = "(\\d{1,3}(?:\\s*[–\\-,;]\\s*\\d{1,3})*)";
+    let re = style === "paren" ? new RegExp(`\\(${list}\\)`, "g")
+      : style === "super" ? /(?<=\p{Ll}{2}[.,;:)]?|\p{Ll}[.,;:)])(\d{1,3}(?:[–\-,]\d{1,3})*)(?=[\s.,;:)]|$)/gu
+        : new RegExp(`\\[${list}\\]`, "g");
+    let found = [];
+    for (let m of text.matchAll(re)) {
+      found.push({ index: m.index, end: m.index + m[0].length, nums: this.bracketNumbers(m[1]) });
+    }
+    return found;
   },
 
   /**
@@ -640,24 +752,72 @@ var RefCheck = {
     let flat = this.searchable(body.replace(/(\p{Ll})-\s*\n\s*(\p{Ll})/gu, "$1$2").replace(/\s+/g, " ")).s;
     // Section offsets shift slightly after flattening; rescale them
     let scale = flat.length / Math.max(1, body.length);
-    let regexes = info.useNumeric ? [] : rows.map((row) => this.authorYearRegex(row.key));
+    let regexes = info.useNumeric ? [] : rows.map((row) => this.authorYearRegex(row.key, "gu"));
 
-    rows.forEach((row) => { row.sections = new Set(); });
+    // row.citeCounts: number of citations of the reference in each section
+    rows.forEach((row) => {
+      row.sections = new Set();
+      row.citeCounts = new Map();
+    });
+    let count = (i, si) => {
+      rows[i].sections.add(si);
+      rows[i].citeCounts.set(si, (rows[i].citeCounts.get(si) || 0) + 1);
+    };
     sections.forEach((sec, si) => {
       let text = flat.slice(Math.floor(sec.start * scale), Math.ceil(sec.end * scale));
       if (info.useNumeric) {
-        for (let cm of text.matchAll(/\[(\d{1,3}(?:\s*[–\-,;]\s*\d{1,3})*)\]/g)) {
-          for (let n of this.bracketNumbers(cm[1])) {
+        for (let c of this.numericCitations(text, info.numStyle)) {
+          for (let n of new Set(c.nums)) {
             let i = info.byNum.get(n);
-            if (i !== undefined) rows[i].sections.add(si);
+            if (i !== undefined) count(i, si);
           }
         }
         return;
       }
       regexes.forEach((re, i) => {
-        if (re && re.test(text)) rows[i].sections.add(si);
+        if (!re) return;
+        for (let _ of text.matchAll(re)) count(i, si);
       });
     });
+  },
+
+  /**
+   * Rows cited in a piece of selected text: its citations ([3], [2–5], Smith et al., 2019),
+   * or, for a selected entry of the reference list, the reference whose DOI/title/text it holds.
+   * @returns {Set<number>} row indexes
+   */
+  rowsCitedIn(rows, text) {
+    let found = new Set();
+    let flat = this.searchable((text || "").replace(/(\p{Ll})-\s*\n\s*(\p{Ll})/gu, "$1$2").replace(/\s+/g, " ")).s;
+    let numeric = rows.find((row) => row.useNumeric);
+    if (numeric) {
+      let byNum = new Map(rows.map((row, i) => [row.key?.num, i]));
+      for (let c of this.numericCitations(flat, numeric.numStyle)) {
+        for (let n of c.nums) {
+          if (byNum.has(n)) found.add(byNum.get(n));
+        }
+      }
+    }
+    else {
+      rows.forEach((row, i) => {
+        if (row.key && this.authorYearRegex(row.key)?.test(flat)) found.add(i);
+      });
+    }
+    if (found.size) return found;
+
+    let compact = this.compact(text);
+    rows.forEach((row, i) => {
+      let doi = row.ref.doi || row.match?.entry.doi;
+      let title = this.compact(row.ref.title || row.match?.entry.title);
+      if ((doi && compact.includes(this.compact(doi))) || (title.length >= 20 && compact.includes(title))) found.add(i);
+    });
+    // References read from the PDF have no separate title: the selection is part of the entry
+    if (!found.size && compact.length >= 30) {
+      rows.forEach((row, i) => {
+        if (this.compact(row.ref.text).includes(compact)) found.add(i);
+      });
+    }
+    return found;
   },
 
   // ---------------------------------------------------------------------------
@@ -751,14 +911,16 @@ var RefCheck = {
   /**
    * Places in the PDF where a reference appears.
    * @param {"citation"|"entry"} what - in-text citations (body) or its entry in the reference list
-   * @returns {{ pageIndex, rects }[]}
+   * @param {object} ref - { key, useNumeric, numStyle, title, doi } of the row
+   * @returns {{ pageIndex, rects, pos }[]} pos orders hits through the whole document
    */
-  findInPDF(data, key, useNumeric, what) {
+  findInPDF(data, ref, what) {
     let { pages, refsAt } = data;
+    let { key, useNumeric, numStyle } = ref;
     let inBody = (p, offset) => !refsAt || p < refsAt.page || (p === refsAt.page && offset < refsAt.offset);
-    let numericRe = /\[(\d{1,3}(?:\s*[–\-,;]\s*\d{1,3})*)\]/g;
+    let starts = this.pageStarts(data);
 
-    // Matches of one method over all pages; author–year methods search the accent-free text
+    // Matches of one method over all pages; name and title methods search the accent-free text
     let search = (method) => {
       let found = [];
       pages.forEach((page, p) => {
@@ -779,8 +941,8 @@ var RefCheck = {
         };
         if (method === "numeric") {
           if (what === "citation") {
-            for (let m of page.text.matchAll(numericRe)) {
-              if (this.bracketNumbers(m[1]).includes(key.num)) hits.push([m.index, m.index + m[0].length]);
+            for (let c of this.numericCitations(page.text, numStyle)) {
+              if (c.nums.includes(key.num)) hits.push([c.index, c.end]);
             }
           }
           else {
@@ -790,59 +952,140 @@ var RefCheck = {
         }
         else if (method === "authorYear") collect(this.authorYearRegex(key, "gu"), true);
         else if (method === "etAl") collect(this.etAlRegex(key, "gu"), true);
+        else if (method === "title") collect(this.titleRegex(ref.title), true);
+        else if (method === "doi" && ref.doi) {
+          collect(new RegExp(ref.doi.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\//g, "\\/\\s*"), "gi"));
+        }
+        // "(?<![\d.])12 Smith" — numbered lists without a dot or bracket
+        else if (method === "bareNumber") collect(new RegExp(`(?<![\\d.,:;–\\-])${key.num}\\s+\\p{Lu}\\p{L}`, "gu"));
 
         hits = hits.filter(([a]) => (what === "citation" ? inBody(p, a) : !inBody(p, a)));
         for (let [a, b] of hits) {
           let rects = this.rectsFor(page, a, b);
-          if (rects.length) found.push({ pageIndex: p, rects });
+          if (rects.length) found.push({ pageIndex: p, rects, pos: starts[p] + a });
         }
       });
       return found;
     };
 
-    // Most likely style first, then the other one, then the name without a year
+    // Most likely style first, then the other one, then the name without a year.
+    // For the list entry, its title or DOI is the surest sign; numbers and names come after.
     let methods = useNumeric ? ["numeric", "authorYear"] : ["authorYear", "numeric"];
     if (what === "citation") methods.push("etAl");
+    else methods = ["title", "doi", ...methods, "bareNumber"];
     for (let method of methods) {
-      if (method === "numeric" && !key.num) continue;
+      if (["numeric", "bareNumber"].includes(method) && !key?.num) continue;
+      if (["authorYear", "etAl"].includes(method) && !key) continue;
       let found = search(method);
       if (found.length) return what === "entry" ? found.slice(0, 1) : found;
     }
     return [];
   },
 
-  /** Button handler: go to the next place where this reference appears */
-  async jumpTo(row, what, button) {
+  /** Regex for the first words of a title, across line breaks and hyphenation, in searchable() text */
+  titleRegex(title) {
+    let words = this.searchable(title || "").s.match(/[\p{L}\p{N}]+/gu) || [];
+    if (words.join("").length < 15) return null;
+    let pattern = words.slice(0, 8).map((w) => w.split("").map((ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("-?\\s?"))
+      .join("[^\\p{L}\\p{N}]{1,4}");
+    return new RegExp(pattern, "giu");
+  },
+
+  /** Offset of each page's text in the whole document, to order hits and sections */
+  pageStarts(data) {
+    if (!data.starts) {
+      let pos = 0;
+      data.starts = data.pages.map((page) => {
+        let start = pos;
+        pos += page.text.length + 1;
+        return start;
+      });
+    }
+    return data.starts;
+  },
+
+  /**
+   * Where each detected section starts in the PDF (same order as `sections`), found by its
+   * heading; null for a heading that can't be found. Cached per set of headings.
+   */
+  sectionStartsInPDF(data, sections) {
+    let cacheKey = sections.map((s) => s.title).join("\n");
+    if (data.sectionStarts?.key === cacheKey) return data.sectionStarts.value;
+    let starts = this.pageStarts(data);
+    let after = { p: 0, offset: 0 };
+    let value = sections.map((sec) => {
+      // "2. Literature review" may be printed "2 Literature review" or "2.Literature review"
+      let words = this.searchable(sec.title).s.replace(/^(\d{1,2}|[IVX]{1,4})\.\s*/, "").match(/[\p{L}\p{N}]+/gu) || [];
+      let num = (sec.title.match(/^(\d{1,2}|[IVX]{1,4})\./) || [])[1];
+      if (!words.length) return null;
+      let re = new RegExp((num ? `(?<![\\p{L}\\p{N}.])${num}\\.?\\s*` : "") + words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[^\\p{L}\\p{N}]{1,3}"), "gu");
+      for (let p = after.p; p < data.pages.length; p++) {
+        let page = data.pages[p];
+        page.norm ||= this.searchable(page.text);
+        re.lastIndex = 0;
+        for (let m of page.norm.s.matchAll(re)) {
+          let offset = page.norm.map[m.index];
+          if (p === after.p && offset < after.offset) continue;
+          after = { p, offset: offset + 1 };
+          return starts[p] + offset;
+        }
+      }
+      return null;
+    });
+    data.sectionStarts = { key: cacheKey, value };
+    return value;
+  },
+
+  /** Hits of a citation search that fall in one section (all hits when the section can't be placed) */
+  hitsInSection(data, hits, sections, si) {
+    let starts = this.sectionStartsInPDF(data, sections);
+    let start = starts[si];
+    if (start == null) return hits;
+    let end = starts.slice(si + 1).find((x) => x != null) ?? Infinity;
+    return hits.filter((h) => h.pos >= start && h.pos < end);
+  },
+
+  /**
+   * Button handler: go to the next place where this reference appears. With a section chosen,
+   * only its citations in that section are visited. The button then shows "2/3".
+   */
+  async jumpTo(row, what, button, label) {
     let win = Zotero.getMainWindow();
     let reader = Zotero.Reader.getByTabID(win.Zotero_Tabs.selectedID);
     if (!reader) return;
-    let original = button.dataset.label || button.textContent;
-    button.dataset.label = original;
+    let section = what === "citation" ? row.currentSection?.() : null;
+    let si = section != null && /^\d+$/.test(section) ? parseInt(section) : null;
+    let cacheKey = what + (si === null ? "" : "|" + si);
     try {
-      if (!row.hits?.[what]) {
+      row.hits ||= {};
+      row.hitIndex ||= {};
+      if (!row.hits[cacheKey]) {
         button.textContent = "Searching…";
         let data = await this.getPageTexts(reader);
-        row.hits = row.hits || {};
-        row.hits[what] = this.findInPDF(data, row.key, row.useNumeric, what);
-        row.hitIndex = row.hitIndex || {};
-        row.hitIndex[what] = -1;
+        let all = row.hits[what] || this.findInPDF(data, {
+          key: row.key, useNumeric: row.useNumeric, numStyle: row.numStyle,
+          title: row.ref.title || row.match?.entry.title || "", doi: row.ref.doi || row.match?.entry.doi || "",
+        }, what);
+        row.hits[what] = all;
+        row.hits[cacheKey] = si === null ? all : this.hitsInSection(data, all, row.sectionList || [], si);
+        row.hitIndex[cacheKey] = -1;
       }
-      let hits = row.hits[what];
+      let hits = row.hits[cacheKey];
       if (!hits.length) {
         // Diagnostic for unsupported layouts: what was searched and what the page text looks like
         let data = reader._refcheckPages;
         let mid = data?.pages[Math.floor(data.pages.length / 2)];
         this.logErrorToFile(`not found (${what})`, new Error(JSON.stringify({
-          key: row.key, useNumeric: row.useNumeric, pages: data?.pages.length,
+          key: row.key, useNumeric: row.useNumeric, numStyle: row.numStyle, title: row.ref.title, pages: data?.pages.length,
           refsAt: data?.refsAt, sample: mid?.text.slice(0, 300),
         })));
         button.textContent = what === "citation" ? "Citation not found" : "Entry not found";
         return;
       }
-      row.hitIndex[what] = (row.hitIndex[what] + 1) % hits.length;
-      let hit = hits[row.hitIndex[what]];
+      row.hitIndex[cacheKey] = (row.hitIndex[cacheKey] + 1) % hits.length;
+      let hit = hits[row.hitIndex[cacheKey]];
       await reader.navigate({ position: { pageIndex: hit.pageIndex, rects: hit.rects } });
-      button.textContent = hits.length > 1 ? `${original} ${row.hitIndex[what] + 1}/${hits.length}` : original;
+      button.textContent = what === "citation" ? `${label} ${row.hitIndex[cacheKey] + 1}/${hits.length} ›` : label;
     }
     catch (e) {
       this.logErrorToFile(`jumpTo(${what})`, e);
@@ -947,13 +1190,18 @@ var RefCheck = {
       if (Array.isArray(list) && list.length) {
         refs = list.map((r) => {
           let title = r["article-title"] || r["volume-title"] || r["series-title"] || "";
-          let text = r.unstructured
+          let text = (r.unstructured || "").trim()
             || [r.author, r.year && `(${r.year})`, title, r["journal-title"]].filter(Boolean).join(". ");
+          let journal = r["journal-title"] || "";
+          let volume = r["volume-title"] || r["series-title"] || "";
+          let type = journal ? (CONFERENCE_RE.test(journal) ? "Conference paper" : "Journal article")
+            : volume ? (CONFERENCE_RE.test(volume) ? "Conference paper" : "Book / chapter") : "";
           return {
             text: text || r.DOI || "", title, doi: r.DOI ? this.cleanDOI(r.DOI) : "",
-            author: r.author || "", year: r.year || "",
+            author: r.author || "", year: r.year || "", journal, type,
           };
         });
+        await this.fillFromCrossref(refs);
       }
     }
     catch (e) {
@@ -961,6 +1209,61 @@ var RefCheck = {
     }
     this._crossrefCache.set(doi, refs);
     return refs;
+  },
+
+  crossrefURL(path) {
+    let email = (Zotero.Prefs.get(PREF_CROSSREF_EMAIL, true) || "").trim();
+    return "https://api.crossref.org/" + path + (email ? (path.includes("?") ? "&" : "?") + "mailto=" + encodeURIComponent(email) : "");
+  },
+
+  /**
+   * Many publishers deposit references as a bare DOI. Without the first author and the year,
+   * their citations can't be found in the text, so fetch those from Crossref (40 DOIs per request).
+   */
+  async fillFromCrossref(refs) {
+    let missing = refs.filter((r) => r.doi && !r.doi.includes(",") && (!r.author || !r.year || !r.title));
+    let types = {
+      "journal-article": "Journal article", "proceedings-article": "Conference paper", book: "Book / chapter",
+      "book-chapter": "Book / chapter", monograph: "Book / chapter", "edited-book": "Book / chapter",
+      dissertation: "Thesis", report: "Report", "posted-content": "Preprint",
+    };
+    let chunks = [];
+    for (let i = 0; i < missing.length; i += 40) chunks.push(missing.slice(i, i + 40));
+    await Promise.all(chunks.map(async (chunk) => {
+      try {
+        let filter = chunk.map((r) => "doi:" + encodeURIComponent(r.doi)).join(",");
+        let get = () => Zotero.HTTP.request("GET",
+          this.crossrefURL(`works?filter=${filter}&rows=${chunk.length}&select=DOI,author,editor,issued,title,container-title,type`), {
+            responseType: "json",
+            timeout: 30000,
+            headers: { Accept: "application/json", "X-User-Agent": `ReferenceChecker/${this.version} (${HOMEPAGE})` },
+          });
+        // Crossref sometimes refuses bursts of requests: try once more after a pause
+        let xhr = await get().catch(async () => {
+          await Zotero.Promise.delay(1500);
+          return get();
+        });
+        let byDOI = new Map((xhr.response?.message?.items || []).map((it) => [this.cleanDOI(it.DOI), it]));
+        for (let r of chunk) {
+          let it = byDOI.get(r.doi);
+          if (!it) continue;
+          let first = (it.author || it.editor || [])[0];
+          r.author ||= first?.family || first?.name || "";
+          r.year ||= String(it.issued?.["date-parts"]?.[0]?.[0] || "");
+          r.title ||= (it.title || [])[0] || "";
+          r.type ||= types[it.type] || "";
+          if (!r.journal && it.type === "journal-article") r.journal = (it["container-title"] || [])[0] || "";
+          // A bare DOI says nothing to the reader: show the work instead
+          if (/^\s*(?:https?:\/\/(?:dx\.)?doi\.org\/)?(?:10\.\S+)?\s*$/i.test(r.text)) {
+            r.text = [r.author + (r.year ? ` (${r.year})` : ""), r.title, r.journal].filter((x) => x.trim()).join(". ")
+              + (r.doi ? ". https://doi.org/" + r.doi : "");
+          }
+        }
+      }
+      catch (e) {
+        this.log("Crossref DOI lookup failed: " + e);
+      }
+    }));
   },
 
   /**
@@ -1018,19 +1321,14 @@ var RefCheck = {
     body.dataset.refcheckToken = token;
     let stale = () => body.dataset.refcheckToken !== token;
 
-    let doc = body.ownerDocument;
-    let el = (tag, cls, text) => {
-      let e = doc.createElementNS(HTML_NS, tag);
-      if (cls) e.className = cls;
-      if (text !== undefined) e.textContent = text;
-      return e;
-    };
+    let el = this.elementMaker(body.ownerDocument);
 
     let { parent, attachment } = await this.resolveTarget(item, tabType);
     if (stale()) return;
 
     let root = el("div", "refcheck");
     body.replaceChildren(root);
+    this.updateBackButtons(body.ownerDocument);
 
     // In the library view, don't parse every selected item automatically
     if (tabType !== "reader" && !force && body.refcheckScanFor !== item.id) {
@@ -1065,6 +1363,12 @@ var RefCheck = {
     if (result.mode === "list") {
       for (let ref of result.refs) {
         let match = this.matchText(ref.text, index, excludeIDs, ref);
+        // The library item knows the first author and year when the reference doesn't
+        if (match) {
+          ref.author ||= match.entry.author;
+          ref.year ||= match.entry.year;
+          ref.title ||= match.entry.title;
+        }
         rows.push({ ref, match });
       }
     }
@@ -1084,7 +1388,10 @@ var RefCheck = {
         let text = await this.getAttachmentText(attachment);
         let body = text.slice(0, this.extractReferenceSection(text).start);
         let info = this.citationInfo(rows, body);
-        rows.forEach((row) => { row.useNumeric = info.useNumeric; });
+        rows.forEach((row) => {
+          row.useNumeric = info.useNumeric;
+          row.numStyle = info.numStyle;
+        });
         // Without a parsed list, reference numbers are unknown: numeric citations can't be followed
         if (result.mode === "matches" && info.useNumeric) rows.forEach((row) => { delete row.key; });
         sections = this.detectSections(body);
@@ -1101,6 +1408,8 @@ var RefCheck = {
       if (row.match) row.status = await this.resolveStatus(row.match.entry, index);
     }));
     if (stale()) return;
+    this.markRelated(rows, parent);
+    rows.forEach((row) => { row.sectionList = sections; });
 
     let inLib = rows.filter((r) => r.status);
     let withFile = inLib.filter((r) => r.status.attachment);
@@ -1114,6 +1423,8 @@ var RefCheck = {
     else {
       summary.textContent = `${inLib.length} works from your library cited · ${withFile.length} with PDF`;
     }
+    let related = rows.filter((r) => r.related).length;
+    if (related) summary.textContent += ` · ${related} related`;
     setSectionSummary?.(`${inLib.length} in library · ${withFile.length} PDF`);
     toolbar.append(summary);
 
@@ -1125,23 +1436,7 @@ var RefCheck = {
     onlyLabel.append(only, " Only in library");
     controls.append(onlyLabel);
 
-    // Zotero's window doesn't support HTML <select> dropdowns reliably, so use clickable chips
-    let chips = (options, current, onPick) => {
-      let box = el("div", "refcheck-chips");
-      for (let opt of options) {
-        let chip = el("button", "refcheck-chip", opt.label);
-        chip.dataset.value = opt.value;
-        chip.disabled = !!opt.disabled;
-        if (opt.title) chip.title = opt.title;
-        chip.classList.toggle("refcheck-chip-active", opt.value === current);
-        chip.addEventListener("click", () => {
-          for (let c of box.children) c.classList.toggle("refcheck-chip-active", c === chip);
-          onPick(opt.value);
-        });
-        box.append(chip);
-      }
-      return box;
-    };
+    let chips = (options, current, onPick) => this.chips(el, options, current, onPick);
 
     let source = Zotero.Prefs.get(PREF_SOURCE, true) || "auto";
     controls.append(
@@ -1160,56 +1455,122 @@ var RefCheck = {
       )
     );
 
-    // Section filter (kept when the panel re-renders for the same item)
-    let wantedSection = body.refcheckSection?.itemID === item.id ? body.refcheckSection.value : "";
-    if (wantedSection !== "" && wantedSection !== "none" && !sections[parseInt(wantedSection)]) wantedSection = "";
-    let sectionRow = null;
-    if (sections.length) {
-      sectionRow = el("div", "refcheck-section-filter");
-      let options = [{ value: "", label: `All (${rows.length})` }];
-      sections.forEach((sec, si) => {
-        let count = rows.filter((r) => r.sections?.has(si)).length;
-        options.push({ value: String(si), label: `${sec.title} (${count})`, disabled: !count });
-      });
-      let notCited = rows.filter((r) => !r.sections?.size).length;
-      if (notCited) {
-        options.push({ value: "none", label: `Citation not located (${notCited})`,
-          title: "References whose citation could not be found in the text" });
-      }
-      sectionRow.append(
-        el("div", "refcheck-source-label", "Cited in section:"),
-        chips(options, wantedSection, (value) => {
-          wantedSection = value;
-          body.refcheckSection = { itemID: item.id, value };
-          applyFilter();
-        })
-      );
+    // Section filter (kept when the panel re-renders for the same item).
+    // The last chip, "Cited by", shows the articles that cite this one instead of its references.
+    // "Selected text" appears when text is selected in the PDF and shows the references cited in it.
+    let saved = body.refcheckSection?.itemID === item.id ? body.refcheckSection : null;
+    let wantedSection = saved?.value || "";
+    let selectedRows = new Set(saved?.selection ? this.rowsCitedIn(rows, saved.selection) : []);
+    if (wantedSection === "selection" && !selectedRows.size) wantedSection = "";
+    if (!["", "none", "citedby", "selection"].includes(wantedSection) && !sections[parseInt(wantedSection)]) wantedSection = "";
+    let doi = parent ? this.cleanDOI(this.field(parent, "DOI") || this.field(parent, "extra")) : "";
+    let knownTotal = this._citedByCache.get(doi + "|" + (Zotero.Prefs.get(PREF_CITEDBY_SORT, true) || "cited"))?.total;
+    let citedByLabel = (total) => "Cited by" + (total === undefined ? "" : ` (${total})`);
+
+    let sectionRow = el("div", "refcheck-section-filter");
+    let options = [
+      { value: "", label: `All (${rows.length})` },
+      { value: "selection", label: `Selected text (${selectedRows.size})` },
+    ];
+    sections.forEach((sec, si) => {
+      let count = rows.filter((r) => r.sections?.has(si)).length;
+      options.push({ value: String(si), label: `${sec.title} (${count})`, disabled: !count });
+    });
+    let notCited = sections.length ? rows.filter((r) => !r.sections?.size).length : 0;
+    if (notCited) {
+      options.push({ value: "none", label: `Citation not located (${notCited})`,
+        title: "References whose citation could not be found in the text" });
     }
-    toolbar.append(controls);
-    if (sectionRow) toolbar.append(sectionRow);
+    options.push({ value: "citedby", label: citedByLabel(knownTotal),
+      title: "Articles that cite this one (from OpenAlex)" });
+    let sectionChips = chips(options, wantedSection, (value) => {
+      wantedSection = value;
+      saved = { ...saved, itemID: item.id, value };
+      body.refcheckSection = saved;
+      applyFilter();
+    });
+    let selectionChip = [...sectionChips.children].find((c) => c.dataset.value === "selection");
+    let showSelectionChip = () => {
+      selectionChip.textContent = `Selected text (${selectedRows.size})`;
+      selectionChip.title = "References cited in the text selected in the PDF: "
+        + (saved?.selection || "").replace(/\s+/g, " ").slice(0, 200);
+      selectionChip.style.display = selectedRows.size ? "" : "none";
+    };
+    showSelectionChip();
+
+    let activate = (value) => {
+      wantedSection = value;
+      for (let c of sectionChips.children) c.classList.toggle("refcheck-chip-active", c.dataset.value === value);
+      showSelectionChip();
+      applyFilter();
+    };
+    // Called when text is selected in the PDF: show only the references cited in it
+    body.refcheckSelect = (text) => {
+      let found = this.rowsCitedIn(rows, text);
+      if (!found.size) {
+        body.refcheckClearSelection();
+        return 0;
+      }
+      selectedRows = found;
+      // Remember the list shown before, to go back to it when the text is deselected
+      let before = wantedSection === "selection" ? saved?.before || "" : wantedSection;
+      saved = { itemID: item.id, value: "selection", selection: text, before };
+      body.refcheckSection = saved;
+      activate("selection");
+      return found.size;
+    };
+    // Called when the text is deselected
+    body.refcheckClearSelection = () => {
+      if (!saved?.selection) return;
+      let back = wantedSection === "selection" ? saved.before || "" : wantedSection;
+      selectedRows = new Set();
+      saved = { itemID: item.id, value: back };
+      body.refcheckSection = saved;
+      activate(back);
+    };
+    sectionRow.append(el("div", "refcheck-source-label", sections.length ? "Cited in section:" : "Show:"), sectionChips);
+    toolbar.append(controls, sectionRow);
     root.replaceChildren(toolbar);
 
-    let sourceNote = el("div", "refcheck-note", "References from " + result.source
-      + (result.mode === "matches" ? " (individual entries could not be separated; showing library matches only)" : ""));
-    root.append(sourceNote);
+    // ---- references view and cited-by view; only one is visible
+    let refsView = el("div", "refcheck-view");
+    let citedView = el("div", "refcheck-view");
+    root.append(refsView, citedView);
 
-    if (result.error) {
-      root.append(el("div", "refcheck-status", result.error));
-      return;
-    }
-    if (!rows.length) {
-      root.append(el("div", "refcheck-status", "No references found."));
-      return;
-    }
+    refsView.append(el("div", "refcheck-note", "References from " + result.source
+      + (result.mode === "matches" ? " (individual entries could not be separated; showing library matches only)" : "")));
 
-    // ---- list
     let list = el("ol", "refcheck-list");
+    let facetState = body.refcheckFacets?.itemID === item.id ? body.refcheckFacets : { itemID: item.id, type: "", journal: "" };
+    body.refcheckFacets = facetState;
+    let facets = this.facetFilters(el, rows, facetState, () => applyFilter());
+    if (result.error) refsView.append(el("div", "refcheck-status", result.error));
+    else if (!rows.length) refsView.append(el("div", "refcheck-status", "No references found."));
+    else refsView.append(facets.element, list);
+
+    let rerender = () => this.renderSection(props, { force: false });
     let applyFilter = () => {
+      let showCited = wantedSection === "citedby";
+      refsView.style.display = showCited ? "none" : "";
+      citedView.style.display = showCited ? "" : "none";
+      if (showCited && !citedView.refcheckLoaded) {
+        citedView.refcheckLoaded = true;
+        this.renderCitedBy(citedView, el, {
+          props, parent, doi, only, force, rerender,
+          onTotal: (total) => {
+            let chip = [...sectionChips.children].find((c) => c.dataset.value === "citedby");
+            if (chip) chip.textContent = citedByLabel(total);
+          },
+        });
+      }
+      citedView.refcheckApply?.();
       rows.forEach((row, i) => {
+        row.updateCiteButton?.(wantedSection);
         let li = list.children[i];
         if (!li) return;
-        let show = !(only.checked && !row.status);
-        if (wantedSection === "none") show = show && !row.sections?.size;
+        let show = !(only.checked && !row.status) && facets.test(row);
+        if (wantedSection === "selection") show = show && selectedRows.has(i);
+        else if (wantedSection === "none") show = show && !row.sections?.size;
         else if (wantedSection !== "") show = show && !!row.sections?.has(parseInt(wantedSection));
         // Inline style so no stylesheet rule can override it
         li.style.display = show ? "" : "none";
@@ -1219,16 +1580,367 @@ var RefCheck = {
       Zotero.Prefs.set(PREF_ONLY_LIB, only.checked, true);
       applyFilter();
     });
-    applyFilter();
 
     rows.forEach((row, i) => {
-      list.append(this.buildRow(el, row, i, props, parent));
+      row.currentSection = () => wantedSection;
+      list.append(this.buildRow(el, row, i, props, rerender));
     });
     applyFilter();
-    root.append(list);
+    this.restoreRow(body, item.id, list);
   },
 
-  buildRow(el, row, i, props, parent) {
+  /** row.parent and row.related: whether each library match is a Related item of the article */
+  markRelated(rows, parent) {
+    let keys = new Set(parent?.relatedItems || []);
+    for (let row of rows) {
+      row.parent = parent;
+      let other = row.status?.item;
+      row.related = !!other && (keys.has(other.key) || (other.relatedItems || []).includes(parent?.key));
+    }
+  },
+
+  elementMaker(doc) {
+    return (tag, cls, text) => {
+      let e = doc.createElementNS(HTML_NS, tag);
+      if (cls) e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    };
+  },
+
+  // Zotero's window doesn't support HTML <select> dropdowns reliably, so use clickable chips
+  chips(el, options, current, onPick) {
+    let box = el("div", "refcheck-chips");
+    for (let opt of options) {
+      let chip = el("button", "refcheck-chip", opt.label);
+      chip.dataset.value = opt.value;
+      chip.disabled = !!opt.disabled;
+      if (opt.title) chip.title = opt.title;
+      chip.classList.toggle("refcheck-chip-active", opt.value === current);
+      chip.addEventListener("click", () => {
+        for (let c of box.children) c.classList.toggle("refcheck-chip-active", c === chip);
+        onPick(opt.value);
+      });
+      box.append(chip);
+    }
+    return box;
+  },
+
+  /** Publication type of a reference known only by its text */
+  guessType(text) {
+    let t = text || "";
+    if (/\b(?:thesis|dissertation)\b/i.test(t)) return "Thesis";
+    if (/\b(?:arxiv|ssrn|preprint|biorxiv|medrxiv|research square)\b/i.test(t)) return "Preprint";
+    if (CONFERENCE_RE.test(t)) return "Conference paper";
+    if (/\b(?:working paper|technical report|tech\. rep|report no|discussion paper)\b/i.test(t)) return "Report";
+    if (/\(eds?\.?\)|\beds?\.,|\beditors?\b|\bpress\b|\bpublishers?\b|\bisbn\b|\b\d+(?:st|nd|rd|th) ed(?:\.|ition)|\bIn:/i.test(t)) {
+      return "Book / chapter";
+    }
+    // Volume(issue) or volume, pages: "24(3), 10–20", "52:4351–4363", "vol. 12"
+    if (/\b\d+\s*\(\d+\)|\bvol\.\s*\d|\b\d+\s*[:,]\s*\d+\s*[–\-]\s*\d+/i.test(t)) return "Journal article";
+    return "Other";
+  },
+
+  /** Type and journal of a row: from the library item when matched, otherwise from the reference */
+  rowFacets(row) {
+    let ref = row.ref || {};
+    let item = row.status?.item;
+    let type = item ? ITEM_TYPE_TO_PUB[item.itemType] || "Other" : ref.type || this.guessType(ref.text);
+    let journal = "";
+    if (type === "Journal article") {
+      journal = (item && this.field(item, "publicationTitle")) || ref.journal || "";
+    }
+    return { type, journal: journal.replace(/\s+/g, " ").trim() };
+  },
+
+  /**
+   * "Type" and "Journal" chip rows for a list of rows.
+   * @param {{ type: string, journal: string }} state - current choice, updated in place
+   * @returns {{ element, test: (row) => boolean }}
+   */
+  facetFilters(el, rows, state, onChange) {
+    rows.forEach((row) => { row.facets ||= this.rowFacets(row); });
+    let journalKey = (name) => this.compact(name.replace(/^the\s+/i, ""));
+    rows.forEach((row) => { row.facets.journalKey = row.facets.journal ? journalKey(row.facets.journal) : ""; });
+
+    let box = el("div", "refcheck-facets");
+    let typeCounts = new Map();
+    for (let row of rows) typeCounts.set(row.facets.type, (typeCounts.get(row.facets.type) || 0) + 1);
+    let types = PUB_TYPES.filter((t) => typeCounts.has(t));
+    if (!types.includes(state.type)) state.type = "";
+    if (types.length > 1) {
+      let line = el("div", "refcheck-section-filter");
+      line.append(
+        el("div", "refcheck-source-label", "Type:"),
+        this.chips(el, [{ value: "", label: "All types" }, ...types.map((t) => ({ value: t, label: `${t} (${typeCounts.get(t)})` }))],
+          state.type, (value) => {
+            state.type = value;
+            onChange();
+          })
+      );
+      box.append(line);
+    }
+
+    // Journals by number of references; the spelling seen first is shown
+    let journals = new Map();
+    for (let row of rows) {
+      let key = row.facets.journalKey;
+      if (!key) continue;
+      let j = journals.get(key) || { name: row.facets.journal, count: 0 };
+      j.count++;
+      journals.set(key, j);
+    }
+    let sorted = [...journals.entries()].sort((a, b) => b[1].count - a[1].count || a[1].name.localeCompare(b[1].name));
+    if (!journals.has(state.journal)) state.journal = "";
+    if (sorted.length) {
+      let line = el("div", "refcheck-section-filter");
+      let chipBox = this.chips(el, [
+        { value: "", label: "All journals" },
+        ...sorted.map(([key, j]) => ({ value: key, label: `${j.name} (${j.count})`, title: j.name })),
+      ], state.journal, (value) => {
+        state.journal = value;
+        onChange();
+      });
+      line.append(el("div", "refcheck-source-label", "Journal:"), chipBox);
+      // Keep the list short: the most frequent journals, plus the selected one
+      let extra = [...chipBox.children].slice(TOP_JOURNALS + 1).filter((c) => c.dataset.value !== state.journal);
+      if (extra.length) {
+        extra.forEach((c) => { c.style.display = "none"; });
+        let more = el("button", "refcheck-chip refcheck-more", `More (${extra.length})`);
+        more.addEventListener("click", () => {
+          extra.forEach((c) => { c.style.display = ""; });
+          more.remove();
+        });
+        chipBox.append(more);
+      }
+      box.append(line);
+    }
+
+    return {
+      element: box,
+      test: (row) => (!state.type || row.facets.type === state.type)
+        && (!state.journal || row.facets.journalKey === state.journal),
+    };
+  },
+
+  // ---------------------------------------------------------------------------
+  // Cited by: articles that cite the current one (from OpenAlex)
+  // ---------------------------------------------------------------------------
+
+  /** GET an OpenAlex API path; null on 404 */
+  async openAlexRequest(path, params = {}) {
+    let key = (Zotero.Prefs.get(PREF_OPENALEX_KEY, true) || "").trim();
+    let email = (Zotero.Prefs.get(PREF_CROSSREF_EMAIL, true) || "").trim();
+    if (key) params.api_key = key;
+    if (email) params.mailto = email;
+    let query = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("&");
+    let xhr = await Zotero.HTTP.request("GET", `https://api.openalex.org/${path}?${query}`, {
+      responseType: "json",
+      timeout: 30000,
+      successCodes: false,
+      headers: { Accept: "application/json" },
+    });
+    if (xhr.status === 404) return null;
+    if (xhr.status === 200) return xhr.response;
+    let detail = xhr.response?.message || xhr.response?.error || `HTTP ${xhr.status}`;
+    if (xhr.status === 429) {
+      throw new Error("OpenAlex's free daily limit for your network has been reached. "
+        + "Add a free OpenAlex API key in Settings → Reference Checker, or try again tomorrow.");
+    }
+    if (xhr.status === 401 || xhr.status === 403) {
+      throw new Error("OpenAlex refused the request (check the API key in Settings → Reference Checker): " + detail);
+    }
+    throw new Error("OpenAlex: " + detail);
+  },
+
+  /** OpenAlex work ID ("W123…") for a DOI, or "" if OpenAlex doesn't know it */
+  async getOpenAlexID(doi) {
+    if (this._openAlexIDs.has(doi)) return this._openAlexIDs.get(doi);
+    let work = await this.openAlexRequest("works/doi:" + encodeURIComponent(doi), { select: "id" });
+    let id = (work?.id || "").replace(/^https?:\/\/openalex\.org\//, "");
+    this._openAlexIDs.set(doi, id);
+    return id;
+  },
+
+  /** An OpenAlex work in the shape of a parsed reference */
+  openAlexWork(w) {
+    let authors = (w.authorships || []).map((a) => a.author?.display_name).filter(Boolean);
+    let names = authors.length > 2 ? authors[0] + " et al." : authors.join(" & ");
+    let year = w.publication_year ? String(w.publication_year) : "";
+    let title = (w.display_name || w.title || "").replace(/<[^>]+>/g, "");
+    let source = w.primary_location?.source;
+    let venue = source?.display_name || "";
+    let type = ["book", "book-chapter"].includes(w.type) ? "Book / chapter"
+      : w.type === "dissertation" ? "Thesis"
+        : w.type === "report" ? "Report"
+          : w.type === "preprint" || source?.type === "repository" ? "Preprint"
+            : source?.type === "conference" ? "Conference paper"
+              : source?.type === "journal" ? "Journal article" : "Other";
+    let text = [names + (year ? ` (${year})` : ""), title, venue].filter(Boolean).join(". ");
+    return {
+      text,
+      title,
+      doi: this.cleanDOI(w.doi),
+      author: (authors[0] || "").split(/\s+/).pop(),
+      year,
+      citedBy: w.cited_by_count || 0,
+      journal: type === "Journal article" ? venue : "",
+      type,
+    };
+  },
+
+  /**
+   * Articles citing a DOI, one page at a time; pages already loaded are kept.
+   * Uses page numbers: OpenAlex only allows cursor paging with an API key.
+   * @param {"cited"|"newest"|"oldest"} sort
+   * @returns {Promise<{ works, total, nextPage, error? }>}
+   */
+  async getCitingWorks(doi, sort, { more = false } = {}) {
+    let key = doi + "|" + sort;
+    let cached = this._citedByCache.get(key);
+    if (cached && (!more || !cached.nextPage)) return cached;
+    try {
+      let id = await this.getOpenAlexID(doi);
+      if (!id) {
+        return { works: [], total: 0, nextPage: null, error: "OpenAlex doesn't know this DOI, so the articles citing it can't be listed." };
+      }
+      let order = { cited: "cited_by_count:desc", newest: "publication_date:desc", oldest: "publication_date:asc" }[sort]
+        || "cited_by_count:desc";
+      let res = await this.openAlexRequest("works", {
+        filter: "cites:" + id,
+        sort: order,
+        "per-page": CITEDBY_PAGE_SIZE,
+        page: cached?.nextPage || 1,
+        select: "id,doi,display_name,publication_year,authorships,cited_by_count,primary_location,type",
+      });
+      let works = (res?.results || []).map((w) => this.openAlexWork(w));
+      let all = [...(cached?.works || []), ...works];
+      let total = res?.meta?.count ?? all.length;
+      let data = {
+        works: all,
+        total,
+        nextPage: works.length && all.length < total ? (cached?.nextPage || 1) + 1 : null,
+      };
+      if (this._citedByCache.size > 20) this._citedByCache.delete(this._citedByCache.keys().next().value);
+      this._citedByCache.set(key, data);
+      return data;
+    }
+    catch (e) {
+      this.log(`OpenAlex lookup failed for ${doi}: ${e}`);
+      return { ...(cached || { works: [], total: 0 }), nextPage: cached?.nextPage || null, error: e.message || String(e) };
+    }
+  },
+
+  /**
+   * Fill the "Cited by" view of the references panel with the articles citing this one.
+   * @param {object} opts.only - the panel's "Only in library" checkbox
+   * @param {Function} opts.rerender - re-renders the whole panel (after an item is saved)
+   * @param {Function} opts.onTotal - called with the number of citing articles
+   */
+  async renderCitedBy(box, el, { props, doi, parent, only, force, rerender, onTotal }) {
+    let item = props.item;
+    let refill = (clear) => {
+      box.refcheckApply = null;
+      this.renderCitedBy(box, el, { props, doi, parent, only, force: clear, rerender, onTotal });
+    };
+    if (!doi) {
+      box.replaceChildren(el("div", "refcheck-status", "This item has no DOI, so the articles citing it can't be looked up."));
+      return;
+    }
+
+    let sort = Zotero.Prefs.get(PREF_CITEDBY_SORT, true) || "cited";
+    if (force) {
+      for (let key of [...this._citedByCache.keys()]) {
+        if (key.startsWith(doi + "|")) this._citedByCache.delete(key);
+      }
+    }
+    box.replaceChildren(el("div", "refcheck-status", "Looking for articles that cite this one…"));
+
+    let index, data;
+    try {
+      [index, data] = await Promise.all([this.getIndex(), this.getCitingWorks(doi, sort)]);
+    }
+    catch (e) {
+      Zotero.logError(e);
+      box.replaceChildren(el("div", "refcheck-status", "Error: " + e.message));
+      return;
+    }
+    if (!box.isConnected) return;
+    onTotal?.(data.total);
+
+    let excludeIDs = new Set([parent?.id, item.id].filter(Boolean));
+    let rows = data.works.map((ref) => ({
+      ref,
+      match: this.matchText(ref.text, index, excludeIDs, ref),
+      note: `Cited ${ref.citedBy} time${ref.citedBy === 1 ? "" : "s"}`,
+    }));
+    await Promise.all(rows.map(async (row) => {
+      if (row.match) row.status = await this.resolveStatus(row.match.entry, index);
+    }));
+    if (!box.isConnected) return;
+    this.markRelated(rows, parent);
+
+    let inLib = rows.filter((r) => r.status);
+    let withFile = inLib.filter((r) => r.status.attachment);
+    let loaded = rows.length < data.total ? ` (${rows.length} loaded)` : "";
+
+    let controls = el("div", "refcheck-controls");
+    controls.append(
+      el("span", "refcheck-source-label", "Sort:"),
+      this.chips(el, [
+        { value: "cited", label: "Most cited" },
+        { value: "newest", label: "Newest" },
+        { value: "oldest", label: "Oldest" },
+      ], sort, (value) => {
+        Zotero.Prefs.set(PREF_CITEDBY_SORT, value, true);
+        refill(false);
+      })
+    );
+    box.replaceChildren(
+      el("div", "refcheck-summary", `${data.total} article${data.total === 1 ? "" : "s"} cite this one${loaded}`
+        + ` · ${inLib.length} in your library · ${withFile.length} with PDF`),
+      controls,
+      el("div", "refcheck-note", "Citing articles from OpenAlex")
+    );
+
+    if (data.error) box.append(el("div", "refcheck-status", data.error));
+    if (!rows.length) {
+      if (!data.error) box.append(el("div", "refcheck-status", "No citing articles found."));
+      return;
+    }
+
+    let list = el("ol", "refcheck-list");
+    rows.forEach((row, i) => list.append(this.buildRow(el, row, i, props, rerender)));
+    let body = props.body;
+    let facetState = body.refcheckCitedFacets?.itemID === item.id ? body.refcheckCitedFacets : { itemID: item.id, type: "", journal: "" };
+    body.refcheckCitedFacets = facetState;
+    let facets = this.facetFilters(el, rows, facetState, () => box.refcheckApply());
+    box.refcheckApply = () => {
+      rows.forEach((row, i) => {
+        list.children[i].style.display = (only.checked && !row.status) || !facets.test(row) ? "none" : "";
+      });
+    };
+    box.refcheckApply();
+    box.append(facets.element, list);
+
+    if (data.nextPage) {
+      let more = el("button", "refcheck-scan", `Load more (${data.total - rows.length} left)`);
+      more.addEventListener("click", async () => {
+        more.disabled = true;
+        more.textContent = "Loading…";
+        let result = await this.getCitingWorks(doi, sort, { more: true });
+        if (result.error) {
+          more.disabled = false;
+          more.textContent = "Load more (failed, try again)";
+          more.title = result.error;
+        }
+        else if (box.isConnected) refill(false);
+      });
+      box.append(more);
+    }
+  },
+
+  buildRow(el, row, i, props, rerender) {
     let { ref, status, match } = row;
     let state = status ? (status.attachment ? "pdf" : "lib") : "none";
     let li = el("li", "refcheck-row refcheck-" + state);
@@ -1240,19 +1952,28 @@ var RefCheck = {
         : "Not in your library";
 
     let main = el("div", "refcheck-main");
+    // Numbered articles: show the reference's number, to check jumps land on "[12]"
+    let number = row.useNumeric && row.key?.num ? el("span", "refcheck-num", `[${row.key.num}]`) : null;
     if (status) {
       let item = status.item;
       let title = el("div", "refcheck-title", item.getField("title") || "(untitled)");
+      if (number) title.prepend(number, " ");
       let creator = item.getCreators()[0];
       let year = (this.field(item, "date").match(/\d{4}/) || [""])[0];
       let meta = [creator && (creator.lastName || creator.firstName), year].filter(Boolean).join(", ");
       main.append(title);
-      if (meta) main.append(el("div", "refcheck-meta", meta + ` · matched by ${match.how}`));
+      let metaLine = el("div", "refcheck-meta", [meta, `matched by ${match.how}`].filter(Boolean).join(" · "));
+      if (row.related) metaLine.append(el("span", "refcheck-related", " · ↔ Related"));
+      main.append(metaLine);
     }
     else {
-      let text = ref.text.length > 260 ? ref.text.slice(0, 257) + "…" : ref.text;
-      main.append(el("div", "refcheck-text", text));
+      let text = number ? ref.text.replace(/^(?:\[\d{1,3}\]|\d{1,3}[.)])\s*/, "") : ref.text;
+      if (text.length > 260) text = text.slice(0, 257) + "…";
+      let line = el("div", "refcheck-text", text);
+      if (number) line.prepend(number, " ");
+      main.append(line);
     }
+    if (row.note) main.append(el("div", "refcheck-meta", row.note));
     if (ref.text) li.title = ref.text;
 
     let actions = el("div", "refcheck-actions");
@@ -1267,16 +1988,22 @@ var RefCheck = {
       return b;
     };
 
+    // Leaving for the library or another tab: come back to this row on return
+    let remember = () => this.rememberRow(props.body, props.item.id, i);
+
     if (status) {
       if (status.attachment) {
-        button("Open PDF", "Open the attachment", () => this.openAttachment(status.attachment));
+        button("Open PDF", "Open the attachment", () => {
+          remember();
+          this.openAttachment(status.attachment);
+        });
       }
       else {
         button("Find PDF", "Download the PDF (Elsevier API if configured, then open-access sources)", async (b) => {
           b.disabled = true;
           let { attachment, reason } = await this.findPDF(status.item, (msg) => { b.textContent = msg; });
           if (attachment) {
-            this.renderSection(props, { force: false });
+            rerender();
           }
           else {
             b.textContent = "No PDF found";
@@ -1290,9 +2017,36 @@ var RefCheck = {
           this.openForConnector(this.articleURL({ text: "", doi: this.field(status.item, "DOI"), title: status.item.getField("title") }));
         });
       }
-      button("Show", "Select this item in the library", () => this.showInLibrary(status.item));
+      button("Show", "Select this item in the library", () => {
+        remember();
+        this.showInLibrary(status.item);
+      });
+      let parent = row.parent;
+      if (parent && parent.id !== status.item.id) {
+        let sameLibrary = parent.libraryID === status.item.libraryID;
+        let relBtn = button(row.related ? "Remove from Related" : "Add to Related",
+          sameLibrary ? "Link this item and the open article as related items (both ways)"
+            : "Related items must be in the same library",
+          async (b) => {
+            b.disabled = true;
+            try {
+              await this.setRelated(parent, status.item, !row.related);
+              row.related = !row.related;
+              b.textContent = row.related ? "Remove from Related" : "Add to Related";
+              main.querySelector(".refcheck-related")?.remove();
+              if (row.related) main.querySelector(".refcheck-meta")?.append(el("span", "refcheck-related", " · ↔ Related"));
+            }
+            catch (e) {
+              Zotero.logError(e);
+              b.title = String(e);
+            }
+            b.disabled = false;
+          });
+        relBtn.disabled = !sameLibrary;
+      }
       li.classList.add("refcheck-clickable");
       li.addEventListener("click", () => {
+        remember();
         if (status.attachment) this.openAttachment(status.attachment);
         else this.showInLibrary(status.item);
       });
@@ -1306,7 +2060,7 @@ var RefCheck = {
             let { status: result, reason } = await this.checkAndSave(doi, (msg) => { b.textContent = msg; });
             if (result === "saved") {
               this._index = null;
-              this.renderSection(props, { force: false });
+              rerender();
             }
             else {
               b.textContent = result === "cancelled" ? "Check PDF" : "No PDF found — try Add";
@@ -1331,10 +2085,20 @@ var RefCheck = {
 
     // In the reader: jump to where the reference is cited, or to its entry in the list
     if (props.tabType === "reader" && row.key) {
-      button("Cited in text ›", "Go to where this reference is cited (click again for the next place)",
-        (b) => this.jumpTo(row, "citation", b));
+      let cite = button("Cited in text ›", "Go to where this reference is cited (click again for the next place)",
+        (b) => this.jumpTo(row, "citation", b, "Cited in text"));
+      // Number of citations, in the chosen section or in the whole text; called when the section changes
+      row.updateCiteButton = (section) => {
+        let total = 0;
+        for (let n of row.citeCounts?.values() || []) total += n;
+        let count = /^\d+$/.test(section ?? "") ? row.citeCounts?.get(parseInt(section)) : total;
+        cite.textContent = row.citeCounts && count ? `Cited in text (${count}) ›` : "Cited in text ›";
+      };
+      row.updateCiteButton(row.currentSection?.());
+    }
+    if (props.tabType === "reader" && (row.key || ref.title)) {
       button("In reference list", "Go to this reference in the article's reference list",
-        (b) => this.jumpTo(row, "entry", b));
+        (b) => this.jumpTo(row, "entry", b, "In reference list"));
     }
 
     li.append(dot, main, actions);
@@ -1344,6 +2108,84 @@ var RefCheck = {
   async openAttachment(attachment) {
     let win = Zotero.getMainWindow();
     await win.ZoteroPane.viewAttachment(attachment.id);
+  },
+
+  /** Link two items as related, both ways (as Zotero's Related box does), or unlink them */
+  async setRelated(a, b, on) {
+    if (on) {
+      a.addRelatedItem(b);
+      b.addRelatedItem(a);
+    }
+    else {
+      a.removeRelatedItem(b);
+      b.removeRelatedItem(a);
+    }
+    await a.saveTx();
+    await b.saveTx();
+  },
+
+  /** Remember which row was used before leaving the reader, to scroll back to it on return */
+  rememberRow(body, itemID, index) {
+    let tabID = body.ownerDocument.defaultView.Zotero_Tabs?.selectedID;
+    this._focus = { body, itemID, index, tabID, pending: true, away: true };
+  },
+
+  /**
+   * After "Show" or "Open PDF", put a "← Back to …" button at the top of the panel in every
+   * other tab, to return to the article (and its row). Removed once back, or if its tab closes.
+   */
+  updateBackButtons(doc) {
+    let f = this._focus;
+    let tabs = doc.defaultView.Zotero_Tabs;
+    let tab = tabs?._tabs?.find((t) => t.id === f?.tabID);
+    let show = !!(f?.away && f.body.isConnected && tab && tabs.selectedID !== f.tabID);
+    let name = show && (f.tabID === "zotero-pane" ? "library" : `“${tab.title || "article"}”`);
+
+    for (let root of doc.querySelectorAll(".refcheck")) {
+      root.querySelector(":scope > .refcheck-back")?.remove();
+      if (!show || f.body.contains(root)) continue;
+      let btn = this.elementMaker(doc)("button", "refcheck-back", `← Back to ${name}`);
+      btn.title = "Return to the article you came from, at the reference you used";
+      btn.addEventListener("click", () => this.goBack(doc.defaultView));
+      root.prepend(btn);
+    }
+    for (let body of doc.querySelectorAll(".refcheck-back-body")) this.renderBackSection(body);
+  },
+
+  /** Return to the article that "Show" / "Open PDF" was used from */
+  goBack(win) {
+    let f = this._focus;
+    let tabs = win.Zotero_Tabs;
+    if (f?.away && tabs?._tabs?.some((t) => t.id === f.tabID)) tabs.select(f.tabID);
+  },
+
+  /** Body of the temporary "Back to article" section */
+  renderBackSection(body) {
+    let doc = body.ownerDocument;
+    let el = this.elementMaker(doc);
+    let f = this._focus;
+    let tab = doc.defaultView.Zotero_Tabs?._tabs?.find((t) => t.id === f?.tabID);
+    body.classList.add("refcheck-back-body");
+    if (!f?.away || !tab) {
+      body.replaceChildren(el("div", "refcheck-status", "Nothing to go back to."));
+      return;
+    }
+    let name = f.tabID === "zotero-pane" ? "library" : `“${tab.title || "article"}”`;
+    let btn = el("button", "refcheck-back", `← Back to ${name}`);
+    btn.addEventListener("click", () => this.goBack(doc.defaultView));
+    body.replaceChildren(btn);
+  },
+
+  /** Scroll the panel back to the remembered row and flash it (once) */
+  restoreRow(body, itemID, list) {
+    let f = this._focus;
+    if (!f?.pending || f.body !== body || f.itemID !== itemID) return;
+    let li = list.children[f.index];
+    if (!li?.isConnected) return;
+    f.pending = false;
+    li.scrollIntoView({ block: "center" });
+    li.classList.add("refcheck-flash");
+    body.ownerDocument.defaultView.setTimeout(() => li.classList.remove("refcheck-flash"), 1500);
   },
 
   async showInLibrary(item) {
@@ -1677,8 +2519,51 @@ var RefCheck = {
   // Reader: select a reference in the PDF → popup says whether it's in the library
   // ---------------------------------------------------------------------------
 
+  /**
+   * Filter the references panel of this PDF to the references cited in the selected text,
+   * and go back to the previous list once the text is deselected (the popup then closes)
+   */
+  selectInPanel(reader, text, doc, append) {
+    let body = this._lastProps?.body;
+    let panelItem = this._lastProps?.item;
+    let readerItem = Zotero.Items.get(reader.itemID);
+    if (!body?.isConnected || !body.refcheckSelect || !panelItem || !readerItem) return;
+    if (panelItem.id !== readerItem.id && panelItem.id !== readerItem.parentItemID) return;
+    try {
+      if (text.trim().length < 3) {
+        body.refcheckClearSelection?.();
+        return;
+      }
+      body.refcheckSelect(text);
+    }
+    catch (e) {
+      Zotero.logError(e);
+      return;
+    }
+
+    let id = this._selectionID = (this._selectionID || 0) + 1;
+    let marker = doc.createElement("div");
+    marker.hidden = true;
+    append(marker);
+    let win = doc.defaultView;
+    let shown = false;
+    let started = Date.now();
+    let timer = win.setInterval(() => {
+      if (marker.isConnected) {
+        shown = true;
+        return;
+      }
+      // Not attached yet: wait a little; if it never shows up, stop watching
+      if (!shown && Date.now() - started < 3000) return;
+      win.clearInterval(timer);
+      // A newer selection replaced this one: it is in charge now
+      if (shown && this._selectionID === id && body.isConnected) body.refcheckClearSelection?.();
+    }, 300);
+  },
+
   onTextSelectionPopup({ reader, doc, params, append }) {
     let text = params?.annotation?.text || "";
+    this.selectInPanel(reader, text, doc, append);
     if (text.length < 20) return;
 
     let looksLikeRef = DOI_RE.test(text) || /\(?\b(1[89]|20)\d{2}[a-z]?\b\)?/.test(text);

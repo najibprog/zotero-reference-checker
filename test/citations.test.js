@@ -73,7 +73,7 @@ test("Cited in text finds every citation in the body, not in the reference list"
   const page = fakePage(article.replace(/\n/g, " ") + refs.join(" "));
   const data = { pages: [page], refsAt: { page: 0, offset: article.indexOf("References") } };
   const key = R.citationKey({ text: refs[3] }, 3);
-  const hits = R.findInPDF(data, key, false, "citation");
+  const hits = R.findInPDF(data, { key, useNumeric: false }, "citation");
   assert.equal(hits.length, 2);
   assert.ok(hits.every((h) => h.rects[0][0] < data.refsAt.offset));
 });
@@ -81,7 +81,7 @@ test("Cited in text finds every citation in the body, not in the reference list"
 test("Cited in text falls back to 'Smith et al.' without a year", () => {
   const page = fakePage("Intro. Smith et al. propose a method. References Smith, J. (2031). T.");
   const data = { pages: [page], refsAt: { page: 0, offset: page.text.indexOf("References") } };
-  const hits = R.findInPDF(data, { num: 1, surname: "Smith", year: "2031" }, false, "citation");
+  const hits = R.findInPDF(data, { key: { num: 1, surname: "Smith", year: "2031" }, useNumeric: false }, "citation");
   assert.equal(hits.length, 1);
 });
 
@@ -89,7 +89,7 @@ test("In reference list finds the entry after the heading", () => {
   const page = fakePage(article.replace(/\n/g, " ") + refs.join(" "));
   const offset = article.indexOf("References");
   const data = { pages: [page], refsAt: { page: 0, offset } };
-  const hits = R.findInPDF(data, R.citationKey({ text: refs[1] }, 1), false, "entry");
+  const hits = R.findInPDF(data, { key: R.citationKey({ text: refs[1] }, 1), useNumeric: false }, "entry");
   assert.equal(hits.length, 1);
   assert.ok(hits[0].rects[0][0] > offset);
 });
@@ -98,4 +98,28 @@ test("rectsFor returns one rectangle per line", () => {
   const page = fakePage("abcdef");
   page.breaks[2] = true;
   assert.deepEqual(plain(R.rectsFor(page, 1, 5)), [[1, 0, 3, 10], [3, 0, 5, 10]]);
+});
+
+test("rowsCitedIn finds the author–year citations in a selection", () => {
+  const { rows, info } = setup();
+  rows.forEach((row) => { row.useNumeric = info.useNumeric; });
+  const pick = (text) => plain([...R.rowsCitedIn(rows, text)].sort());
+  assert.deepEqual(pick("Routing has been studied widely (Smith et al., 2019; Jones, 2018)."), [1, 3]);
+  assert.deepEqual(pick("Mladenovi ́c and Hansen (1997) introduced VNS."), [2]);
+  assert.deepEqual(pick("Nothing cited here."), []);
+});
+
+test("rowsCitedIn follows numeric citations", () => {
+  const rows = ["[1] A. One", "[2] B. Two", "[3] C. Three", "[4] D. Four"].map((text) => ({ ref: { text } }));
+  rows.forEach((row, i) => { row.key = R.citationKey(row.ref, i); row.useNumeric = true; });
+  assert.deepEqual(plain([...R.rowsCitedIn(rows, "as shown in [1, 3–4]")].sort()), [0, 2, 3]);
+});
+
+test("rowsCitedIn recognises a selected reference-list entry", () => {
+  const rows = [
+    { ref: { text: "Brown, A. (2021). A comparison of routing methods for buses. J. Res., 1, 1–2.", title: "" } },
+    { ref: { text: "Jones, B. (2018). An early study.", title: "An early study of public transport networks", doi: "10.1000/xyz.1" } },
+  ];
+  assert.deepEqual(plain([...R.rowsCitedIn(rows, "A comparison of routing methods for buses. J. Res.")]), [0]);
+  assert.deepEqual(plain([...R.rowsCitedIn(rows, "An early study of public\ntransport networks. doi:10.1000/xyz.1")]), [1]);
 });
