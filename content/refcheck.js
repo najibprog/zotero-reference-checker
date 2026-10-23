@@ -29,6 +29,7 @@ var PREF_ELS_TOKEN = "extensions.refcheck.elsevierInstToken";
 var PREF_CROSSREF_EMAIL = "extensions.refcheck.crossrefEmail";
 var PREF_OPENALEX_KEY = "extensions.refcheck.openalexApiKey";
 var PREF_CITEDBY_SORT = "extensions.refcheck.citedBySort";
+var PREF_REF_ORDER = "extensions.refcheck.refOrder";
 var CITEDBY_PAGE_SIZE = 100;
 // Publication types offered by the Type filter, in display order
 var PUB_TYPES = ["Journal article", "Conference paper", "Book / chapter", "Thesis", "Report", "Preprint", "Other"];
@@ -661,7 +662,10 @@ var RefCheck = {
       if (cited.size > best.count && cited.size >= needed) best = { style, count: cited.size };
     }
     return {
-      useNumeric: best.count > byAuthorYear,
+      // Numbered equations "(1)…(49)" look like citations in parentheses: when author–year
+      // citations are common too, trust only brackets
+      useNumeric: best.count > byAuthorYear
+        && (best.style === "bracket" || byAuthorYear < Math.max(3, rows.length * 0.2)),
       numStyle: best.style,
       byNum: new Map(rows.map((row, i) => [row.key.num, i])),
     };
@@ -739,8 +743,17 @@ var RefCheck = {
 
   surnamePattern(key) {
     if (!key.surname) return null;
-    let sur = this.searchable(key.surname).s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return `(?<![\\p{L}])${sur}(?![\\p{L}])`;
+    let escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    let plain = this.searchable(key.surname).s;
+    let sur = escape(plain);
+    // Organisations listed in capitals are often cited capitalised: "FEVAD" → "(Fevad, 2023)"
+    if (plain.length >= 3 && /^\p{Lu}+$/u.test(plain)) {
+      sur = `(?:${sur}|${escape(plain[0] + plain.slice(1).toLowerCase())})`;
+    }
+    // Zotero's PDF text can drop the space before a name ("seeChapuis et al.", "inOzturk (2019)"):
+    // a capitalised surname may follow a lowercase letter, but not "Mc"/"Mac" (McDonald, MacLean)
+    let before = /^\p{Lu}/u.test(plain) ? "(?<!\\p{Lu}|Mc|Mac)" : "(?<!\\p{L})";
+    return `${before}${sur}(?![\\p{L}])`;
   },
 
   /**
@@ -755,28 +768,35 @@ var RefCheck = {
     let regexes = info.useNumeric ? [] : rows.map((row) => this.authorYearRegex(row.key, "gu"));
 
     // row.citeCounts: number of citations of the reference in each section
+    // row.firstPos: position of its first citation in each section; row.firstAt: in the whole text
     rows.forEach((row) => {
       row.sections = new Set();
       row.citeCounts = new Map();
+      row.firstPos = new Map();
+      row.firstAt = null;
     });
-    let count = (i, si) => {
-      rows[i].sections.add(si);
-      rows[i].citeCounts.set(si, (rows[i].citeCounts.get(si) || 0) + 1);
+    let count = (i, si, pos) => {
+      let row = rows[i];
+      row.sections.add(si);
+      row.citeCounts.set(si, (row.citeCounts.get(si) || 0) + 1);
+      if (!row.firstPos.has(si) || pos < row.firstPos.get(si)) row.firstPos.set(si, pos);
+      if (row.firstAt === null || pos < row.firstAt) row.firstAt = pos;
     };
     sections.forEach((sec, si) => {
-      let text = flat.slice(Math.floor(sec.start * scale), Math.ceil(sec.end * scale));
+      let offset = Math.floor(sec.start * scale);
+      let text = flat.slice(offset, Math.ceil(sec.end * scale));
       if (info.useNumeric) {
         for (let c of this.numericCitations(text, info.numStyle)) {
           for (let n of new Set(c.nums)) {
             let i = info.byNum.get(n);
-            if (i !== undefined) count(i, si);
+            if (i !== undefined) count(i, si, offset + c.index);
           }
         }
         return;
       }
       regexes.forEach((re, i) => {
         if (!re) return;
-        for (let _ of text.matchAll(re)) count(i, si);
+        for (let m of text.matchAll(re)) count(i, si, offset + m.index);
       });
     });
   },
@@ -802,6 +822,19 @@ var RefCheck = {
       rows.forEach((row, i) => {
         if (row.key && this.authorYearRegex(row.key)?.test(flat)) found.add(i);
       });
+      // Only the names selected, without the year: "Ozturk and Patrick", "Chapuis et al."
+      if (!found.size) {
+        rows.forEach((row, i) => {
+          if (row.key && this.etAlRegex(row.key)?.test(flat)) found.add(i);
+        });
+      }
+      // A short selection that is just a surname: "Ozturk"
+      if (!found.size && flat.length <= 60) {
+        rows.forEach((row, i) => {
+          let sur = row.key && this.surnamePattern(row.key);
+          if (sur && new RegExp(sur, "u").test(flat)) found.add(i);
+        });
+      }
     }
     if (found.size) return found;
 
@@ -1096,7 +1129,7 @@ var RefCheck = {
 
   splitReferences(section) {
     let text = section.replace(/\r\n?/g, "\n").replace(/\u00ad/g, "");
-    let parts = this.splitNumbered(text);
+    let parts = this.splitNumbered(text) || this.splitBulleted(text);
     let numbered = !!parts;
 
     if (!parts) {
@@ -1161,6 +1194,16 @@ var RefCheck = {
       }
     }
     return null;
+  },
+
+  /**
+   * Split a bulleted list ("• Smith, J. (2019)… • Jones…"). The bullet may start a line,
+   * sit on a line of its own, or be inline when the PDF text has no line breaks.
+   */
+  splitBulleted(text) {
+    let re = /(?:^|\s)[•▪◦●■‣](?=\s)/gu;
+    if ((text.match(re) || []).length < 3) return null;
+    return text.split(re).slice(1);
   },
 
   joinLine(a, b) {
@@ -1544,9 +1587,26 @@ var RefCheck = {
     let facetState = body.refcheckFacets?.itemID === item.id ? body.refcheckFacets : { itemID: item.id, type: "", journal: "" };
     body.refcheckFacets = facetState;
     let facets = this.facetFilters(el, rows, facetState, () => applyFilter());
+    // Order: as in the reference list, or by first citation in the text (in the selected section)
+    let order = Zotero.Prefs.get(PREF_REF_ORDER, true) || "list";
+    let orderRow = null;
+    if (rows.some((row) => row.firstAt !== null && row.firstAt !== undefined)) {
+      orderRow = el("div", "refcheck-controls");
+      orderRow.append(
+        el("span", "refcheck-source-label", "Order:"),
+        this.chips(el, [
+          { value: "list", label: "Reference list" },
+          { value: "text", label: "Order in text" },
+        ], order, (value) => {
+          order = value;
+          Zotero.Prefs.set(PREF_REF_ORDER, value, true);
+          applyFilter();
+        })
+      );
+    }
     if (result.error) refsView.append(el("div", "refcheck-status", result.error));
     else if (!rows.length) refsView.append(el("div", "refcheck-status", "No references found."));
-    else refsView.append(facets.element, list);
+    else refsView.append(...[orderRow, facets.element, list].filter(Boolean));
 
     let rerender = () => this.renderSection(props, { force: false });
     let applyFilter = () => {
@@ -1574,6 +1634,9 @@ var RefCheck = {
         else if (wantedSection !== "") show = show && !!row.sections?.has(parseInt(wantedSection));
         // Inline style so no stylesheet rule can override it
         li.style.display = show ? "" : "none";
+        // Reorder visually (CSS order in the flex list) so rows keep their index in the DOM
+        let pos = /^\d+$/.test(wantedSection) ? row.firstPos?.get(parseInt(wantedSection)) : row.firstAt;
+        li.style.order = orderRow && order === "text" ? String(pos ?? 1e9 + i) : "";
       });
     };
     only.addEventListener("change", () => {

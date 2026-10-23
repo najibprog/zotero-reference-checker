@@ -123,3 +123,48 @@ test("rowsCitedIn recognises a selected reference-list entry", () => {
   assert.deepEqual(plain([...R.rowsCitedIn(rows, "A comparison of routing methods for buses. J. Res.")]), [0]);
   assert.deepEqual(plain([...R.rowsCitedIn(rows, "An early study of public\ntransport networks. doi:10.1000/xyz.1")]), [1]);
 });
+
+test("an organisation in capitals is found when cited capitalised", () => {
+  const key = R.citationKey({ text: "FEVAD. (février 7, 2023). Chiffre d'affaires annuel du e-commerce." }, 0);
+  assert.match("an increase of 41% (Fevad, 2023). This", R.authorYearRegex(key));
+  assert.match("as reported by FEVAD (2023)", R.authorYearRegex(key));
+});
+
+test("finds names glued to the previous word, as in Zotero's PDF text", () => {
+  const key = R.citationKey({ text: "Chapuis, C. (2020). Restoring public transit." }, 0);
+  assert.match("underused out of the peak (seeChapuis et al. ,2020 ). There", R.authorYearRegex(key));
+  assert.match("as reported inChapuis ( 2020), in Canada", R.authorYearRegex(key));
+  // but not inside another capitalised name
+  assert.doesNotMatch("MacChapuis (2020)", R.authorYearRegex(key));
+});
+
+test("numbered equations don't make an author–year paper look numeric", () => {
+  const authors = ["Archetti", "Behiri", "Boudet", "Bruzzone", "Ceselli", "Chapuis", "Chauhan", "Cherkesly", "Church", "Cochrane"];
+  const rows = authors.map((a) => ({ ref: { text: `${a}, A. (2019). A title of the work.` } }));
+  const cites = authors.map((a) => `as shown by ${a} et al. (2019).`).join(" ");
+  const equations = authors.map((_, i) => `x + y ≤ 1 (${i + 1})`).join("\n");
+  const info = R.citationInfo(rows, cites + "\n" + equations + "\n" + equations);
+  assert.equal(info.useNumeric, false);
+});
+
+test("selected text without the year still finds the reference by its authors", () => {
+  const rows = [
+    { ref: { text: "Ozturk, O., Patrick, J., 2018. An optimization model for freight transport." } },
+    { ref: { text: "Chapuis, C., 2020. Restoring public transit amid COVID-19." } },
+  ];
+  rows.forEach((row, i) => { row.key = R.citationKey(row.ref, i); });
+  assert.deepEqual([...R.rowsCitedIn(rows, "Ozturk and Patrick ,2018")], [0]);
+  assert.deepEqual([...R.rowsCitedIn(rows, "Ozturk and Patrick")], [0]);
+  assert.deepEqual([...R.rowsCitedIn(rows, "seeChapuis et al.")], [1]);
+  assert.deepEqual([...R.rowsCitedIn(rows, "Chapuis")], [1]);
+});
+
+test("remembers where each reference is first cited, overall and per section", () => {
+  const rows = ["Archetti, C. (2021). A.", "Boudet, B. (2007). B.", "Chapuis, C. (2020). C."].map((text) => ({ ref: { text } }));
+  const body = "1. Introduction\nAs Chapuis (2020) and Archetti (2021) say.\n2. Literature review\nBoudet (2007) then Archetti (2021).\n3. Method\nNothing.\n";
+  const info = R.citationInfo(rows, body);
+  R.assignSections(rows, body, R.detectSections(body), info);
+  const byFirst = [...rows.keys()].sort((a, b) => rows[a].firstAt - rows[b].firstAt);
+  assert.deepEqual(byFirst, [2, 0, 1]);                         // Chapuis, Archetti, Boudet
+  assert.ok(rows[1].firstPos.get(1) < rows[0].firstPos.get(1)); // in section 2: Boudet before Archetti
+});

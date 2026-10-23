@@ -36,6 +36,7 @@ Open an article. In the right-hand pane, open the **References in Library** sect
 **Filters:**
 
 - **Only in library** hides the grey entries.
+- **Order**: *Reference list* keeps the order of the article's bibliography; *Order in text* lists references in the order they are first cited. With a section selected, it follows the order within that section. References whose citation wasn't located come last.
 - **Type** shows only one kind of publication: *Journal article*, *Conference paper*, *Book / chapter*, *Thesis*, *Report*, *Preprint* or *Other*, with a count for each. It comes from the library item when the reference is in your library, from Crossref or OpenAlex when they say, and otherwise is guessed from the reference text.
 - **Journal** shows only the references published in one journal. The most frequent journals are listed first; **More** shows the rest. Journal names are known for references in your library and those from Crossref or OpenAlex, not for references read from the PDF text.
 - **Cited in section** shows only the references cited in one part of the article, such as *1. Introduction* or *2. Literature review*. Each section shows a count. *Citation not located* lists the rest.
@@ -60,7 +61,7 @@ Open an article. In the right-hand pane, open the **References in Library** sect
 
 **Select text in the PDF:** highlight a reference in the bibliography. The popup shows *In library: …* with an **Open PDF** button, or *Not in your library* with an **Add** button.
 
-**Selected text:** select a sentence or paragraph in the PDF, and the panel shows only the references cited in it ("(Smith et al., 2019; Jones, 2018)", "[3, 5–7]"), under a **Selected text (N)** chip. Selecting an entry of the reference list shows just that reference. Click **All** or another chip to go back.
+**Selected text:** select a sentence or paragraph in the PDF, and the panel shows only the references cited in it ("(Smith et al., 2019; Jones, 2018)", "[3, 5–7]"). Selecting just the names, such as "Smith and Jones", also works; if that author has several references, they are all shown, under a **Selected text (N)** chip. Selecting an entry of the reference list shows just that reference. Click **All** or another chip to go back.
 
 **Cited by:** the last chip of the section filter, **Cited by**, swaps the list for the articles that cite this one, from [OpenAlex](https://openalex.org). It needs the article's DOI.
 
@@ -156,8 +157,8 @@ If something goes wrong at startup, the plugin writes `reference-checker-startup
 1. Run through the manual checklist below.
 2. Tag and push. The version comes from the tag:
    ```bash
-   git tag v1.3.2
-   git push origin v1.3.2
+   git tag v1.3.3
+   git push origin v1.3.3
    ```
 3. The **Release** workflow runs the tests, sets the version in `manifest.json`, builds `zotero-reference-checker.xpi`, publishes the GitHub release, and updates `updates.json` in the fixed `release` release. That's the file Zotero checks for updates, so don't delete that release.
 
@@ -172,7 +173,7 @@ The parts that depend on Zotero's interface, your browser or your network can't 
 - [ ] After **Open PDF** and **Show**, the red **←** side-bar icon appears and returns to the article, which scrolls to the reference used.
 - [ ] **Cited by** loads citing articles; **Sort** and **Load more** work.
 - [ ] **Type**, **Journal** and **Selected text** filter the list. **Add to Related** / **Remove from Related** update the article's Related box.
-- [ ] **Only in library**, **Cited in section** and **Source** filter or reload the list.
+- [ ] **Only in library**, **Cited in section**, **Order** and **Source** filter, reorder or reload the list.
 - [ ] **Cited in text ›** jumps and highlights, and cycles *1/n → 2/n*. **In reference list** jumps to the entry.
 - [ ] **Check PDF** on an open-access reference asks for a collection and saves the item with its PDF.
 - [ ] **Add** opens the browser. After saving with the Connector, the row turns green by itself.

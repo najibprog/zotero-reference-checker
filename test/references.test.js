@@ -126,3 +126,23 @@ test("splits year-ending entries whose first author has a multi-word surname", (
   const wrapped = "T. Bektaş, T. G. Crainic, and T. Van Woensel. From Managing Urban Freight to Smart City\nLogistics Networks, volume 8 of Series on Computers and Operations Research, chapter 7, pages 143–188. World Scientific, 2017.\nI. Ben Mohamed, W. Klibi, O. Labarthe, J.-C. Deschamps, and M. Z. Babai. Modelling and\nsolution approaches for the interconnected city logistics. Int. J. Prod. Res., 55(9):2664–2684, 2017.";
   assert.equal(R.splitReferences(wrapped).length, 2);
 });
+
+test("splits bulleted lists, wherever the PDF text puts the bullets", () => {
+  const entries = [
+    "Ben Mohamed, I., Klibi, W., & Labarthe, O. (2017). Modelling and solution approaches for the interconnected city logistics.",
+    "ELISE : une belle idée pour vos déchets. https://www.elise.com.fr/accueil.html",
+    "FEVAD. (février 7, 2023). Chiffre d'affaires annuel du e-commerce en France.",
+    "Ghilas, V., Demir, E., & Van Woensel, T. (2013). Integrating passenger and freight transportation.",
+  ];
+  const layouts = [
+    entries.map((e) => "• " + e).join("\n"),   // bullet starts each line
+    entries.map((e) => "•\n" + e).join("\n"),  // bullet on a line of its own
+    entries.map((e) => "• " + e).join(" "),    // no line breaks
+  ];
+  for (const section of layouts) {
+    const refs = R.splitReferences(section);
+    assert.equal(refs.length, 4);
+    assert.match(refs[1], /^ELISE/);
+    assert.match(refs[3], /^Ghilas/);
+  }
+});

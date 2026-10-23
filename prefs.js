@@ -7,3 +7,5 @@ pref("extensions.refcheck.crossrefEmail", "");
 pref("extensions.refcheck.openalexApiKey", "");
 // "cited", "newest" or "oldest"
 pref("extensions.refcheck.citedBySort", "cited");
+// "list" (reference list order) or "text" (order of first citation in the text)
+pref("extensions.refcheck.refOrder", "list");
