@@ -108,6 +108,7 @@ var RefCheck = {
   _lastProps: null,
   _waitingForConnector: false,
   _refreshTimer: null,
+  _connectorDeadline: 0,
 
   init({ id, version, rootURI }) {
     this.id = id;
@@ -261,12 +262,27 @@ var RefCheck = {
       this.notifierID = Zotero.Notifier.registerObserver(
         {
           notify: (event, type, ids) => {
-            // Annotations are items too; creating them while reading shouldn't rebuild the index
-            let onlyAnnotations = ids.every((id) => Zotero.Items.get(id)?.isAnnotation?.());
-            if (!onlyAnnotations && ["add", "modify", "delete", "trash", "refresh"].includes(event)) {
-              this._index = null;
-              if (event === "add" || event === "modify") this.scheduleRefresh();
-            }
+            // Only process events that may affect the index.
+            if (!["add", "modify", "delete", "trash", "refresh"].includes(event)) return;
+
+            // Ignore note and annotation changes.
+            // These do not affect bibliographic metadata.
+            const onlyNonBibliographic =
+              Array.isArray(ids) &&
+              ids.length > 0 &&
+              ids.every((id) => {
+              const item = Zotero.Items.get(id);
+
+              // Unknown/deleted items are NOT filtered out,
+              // so potentially relevant changes remain detectable.
+              if (!item) return false;
+
+              return item.isAnnotation?.() || item.isNote?.();
+            });
+            if (onlyNonBibliographic) return;
+
+            this._index = null;
+            if(event === "add" || event === "modify") this.scheduleRefresh();
           },
         },
         ["item"],
@@ -2378,17 +2394,30 @@ var RefCheck = {
    */
   openForConnector(url) {
     this._waitingForConnector = true;
+    this._connectorDeadline = Date.now() + 120_000;
     Zotero.launchURL(url);
   },
 
   /** Called by the notifier: refresh the visible panel shortly after items were added */
   scheduleRefresh() {
     if (!this._waitingForConnector || !this._lastProps) return;
+    // Stop accepting notifications from an expired import.
+    if (Date.now() >= this._connectorDeadline) {
+      this._waitingForConnector = false;
+      return;
+    }
     let win = Zotero.getMainWindow();
     if (!win) return;
     win.clearTimeout(this._refreshTimer);
     // The Connector saves the item first and the PDF a moment later; wait for both
     this._refreshTimer = win.setTimeout(() => {
+      this._refreshTimer = null;
+
+      const valid = this._waitingForConnector && Date.now() < this._connectorDeadline;
+      this._waitingForConnector = false;
+      this._connectorDeadline = 0;
+      if(!valid) return;
+
       let props = this._lastProps;
       if (props?.body?.isConnected) {
         this.renderSection(props, { force: false });
